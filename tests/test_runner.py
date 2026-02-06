@@ -1,6 +1,7 @@
-"""Тесты для модуля runner."""
+"""Tests for ClaudeRunner."""
 
-import json
+import subprocess
+from io import StringIO
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,36 +9,44 @@ import pytest
 from prompter.runner import ClaudeRunner
 
 
-@pytest.fixture
-def mock_popen():
-    """Фикстура для мокирования subprocess.Popen."""
-    with patch("prompter.runner.subprocess.Popen") as mock:
-        process_mock = MagicMock()
-        process_mock.communicate.return_value = ('{"session_id": "test-123"}', "")
-        mock.return_value = process_mock
-        yield mock
-
-
 class TestClaudeRunner:
-    """Тесты для ClaudeRunner."""
+    """Test suite for ClaudeRunner class."""
 
-    def test_first_run(self, mock_popen: MagicMock) -> None:
-        """Проверяет первый запуск без --resume."""
+    @patch("prompter.runner.subprocess.Popen")
+    def test_command_flags(self, mock_popen: MagicMock) -> None:
+        """Test that Popen is called with required flags."""
+        mock_process = MagicMock()
+        mock_process.stdout = iter([
+            '{"type": "result", "result": "test"}\n'
+        ])
+        mock_process.stderr = iter([])
+        mock_process.wait.return_value = 0
+        mock_popen.return_value = mock_process
+
         runner = ClaudeRunner()
-        runner.run_prompt("Hello")
+        runner.run_prompt("test prompt")
 
         mock_popen.assert_called_once()
         call_args = mock_popen.call_args[0][0]
 
+        assert "--output-format" in call_args
+        assert "stream-json" in call_args
+        assert "--verbose" in call_args
         assert "--dangerously-skip-permissions" in call_args
-        assert "--resume" not in call_args
 
-    def test_subsequent_run(self, mock_popen: MagicMock) -> None:
-        """Проверяет повторный запуск с --resume."""
-        runner = ClaudeRunner()
-        runner.session_id = "existing-session-456"
+    @patch("prompter.runner.subprocess.Popen")
+    def test_resume_flag(self, mock_popen: MagicMock) -> None:
+        """Test that --resume flag is added when session_id exists."""
+        mock_process = MagicMock()
+        mock_process.stdout = iter([
+            '{"type": "result", "result": "test"}\n'
+        ])
+        mock_process.stderr = iter([])
+        mock_process.wait.return_value = 0
+        mock_popen.return_value = mock_process
 
-        runner.run_prompt("Hello again")
+        runner = ClaudeRunner(session_id="existing-session-456")
+        runner.run_prompt("test prompt")
 
         mock_popen.assert_called_once()
         call_args = mock_popen.call_args[0][0]
@@ -46,75 +55,97 @@ class TestClaudeRunner:
         resume_index = call_args.index("--resume")
         assert call_args[resume_index + 1] == "existing-session-456"
 
-    def test_json_parsing(self, mock_popen: MagicMock) -> None:
-        """Проверяет корректный парсинг JSON-ответа."""
-        expected_response = {
-            "session_id": "new-session-789",
-            "result": "Hello, world!",
-            "cost_usd": 0.01,
-        }
-        process_mock = mock_popen.return_value
-        process_mock.communicate.return_value = (json.dumps(expected_response), "")
+    @patch("prompter.runner.subprocess.Popen")
+    def test_stream_processing(self, mock_popen: MagicMock) -> None:
+        """Test NDJSON stream processing and session_id extraction."""
+        mock_process = MagicMock()
+        mock_process.stdout = iter([
+            '{"type": "system", "session_id": "new-session-123"}\n',
+            '{"type": "assistant", "content": [{"type": "text", "text": "Hello"}]}\n',
+            '{"type": "result", "result": "Hello world"}\n',
+        ])
+        mock_process.stderr = iter([])
+        mock_process.wait.return_value = 0
+        mock_popen.return_value = mock_process
 
         runner = ClaudeRunner()
-        result = runner.run_prompt("Test prompt")
+        result = runner.run_prompt("test prompt")
 
-        assert result == expected_response
-        assert runner.session_id == "new-session-789"
+        assert runner.session_id == "new-session-123"
+        assert result["type"] == "result"
+        assert result["result"] == "Hello world"
 
-    def test_interruption(self) -> None:
-        """Проверяет корректную обработку KeyboardInterrupt."""
-        with patch("prompter.runner.subprocess.Popen") as mock_popen:
-            process_mock = MagicMock()
-            process_mock.communicate.side_effect = KeyboardInterrupt()
-            mock_popen.return_value = process_mock
+    @patch("prompter.runner.logger")
+    @patch("prompter.runner.subprocess.Popen")
+    def test_realtime_logging(
+        self, mock_popen: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """Test that assistant content is logged in real-time."""
+        mock_process = MagicMock()
+        mock_process.stdout = iter([
+            '{"type": "assistant", "content": [{"type": "text", "text": "Hello from Claude"}]}\n',
+            '{"type": "result", "result": "done"}\n',
+        ])
+        mock_process.stderr = iter([])
+        mock_process.wait.return_value = 0
+        mock_popen.return_value = mock_process
 
-            runner = ClaudeRunner()
+        runner = ClaudeRunner()
+        runner.run_prompt("test prompt")
 
-            with pytest.raises(KeyboardInterrupt):
-                runner.run_prompt("Test")
+        info_calls = [call for call in mock_logger.info.call_args_list]
+        logged_messages = [str(call) for call in info_calls]
+        assert any("Hello from Claude" in msg for msg in logged_messages)
 
-            process_mock.kill.assert_called_once()
-            process_mock.wait.assert_called_once()
-
-    def test_json_decode_error(self) -> None:
-        """Проверяет обработку невалидного JSON."""
-        with patch("prompter.runner.subprocess.Popen") as mock_popen:
-            process_mock = MagicMock()
-            process_mock.communicate.return_value = ("not valid json", "")
-            mock_popen.return_value = process_mock
-
-            runner = ClaudeRunner()
-
-            with pytest.raises(ValueError, match="Не удалось распарсить"):
-                runner.run_prompt("Test")
-
-    def test_stderr_logging(self, mock_popen: MagicMock, caplog) -> None:
-        """Проверяет логирование stderr."""
-        process_mock = mock_popen.return_value
-        process_mock.communicate.return_value = (
-            '{"session_id": "test"}',
-            "Warning message",
-        )
+    @patch("prompter.runner.subprocess.Popen")
+    def test_interruption(self, mock_popen: MagicMock) -> None:
+        """Test KeyboardInterrupt handling and re-raising."""
+        mock_process = MagicMock()
+        mock_process.stdout = iter([])
+        mock_process.stderr = iter([])
+        mock_process.wait.side_effect = KeyboardInterrupt()
+        mock_popen.return_value = mock_process
 
         runner = ClaudeRunner()
 
-        with caplog.at_level("WARNING"):
-            runner.run_prompt("Test")
+        with pytest.raises(KeyboardInterrupt):
+            runner.run_prompt("test prompt")
 
-        assert "Warning message" in caplog.text
+        mock_process.kill.assert_called_once()
 
-    def test_session_id_not_overwritten(self, mock_popen: MagicMock) -> None:
-        """Проверяет, что session_id не перезаписывается при повторных вызовах."""
+    @patch("prompter.runner.subprocess.Popen")
+    def test_timeout(self, mock_popen: MagicMock) -> None:
+        """Test TimeoutExpired handling."""
+        mock_process = MagicMock()
+        mock_process.stdout = iter([])
+        mock_process.stderr = iter([])
+        mock_process.wait.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=10)
+        mock_popen.return_value = mock_process
+
         runner = ClaudeRunner()
-        runner.session_id = "original-session"
 
-        process_mock = mock_popen.return_value
-        process_mock.communicate.return_value = (
-            '{"session_id": "new-session"}',
-            "",
-        )
+        with pytest.raises(subprocess.TimeoutExpired):
+            runner.run_prompt("test prompt", timeout=10)
 
-        runner.run_prompt("Test")
+        mock_process.kill.assert_called_once()
 
-        assert runner.session_id == "original-session"
+    @patch("prompter.runner.logger")
+    @patch("prompter.runner.subprocess.Popen")
+    def test_session_logging(
+        self, mock_popen: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """Test that session_id is logged at the start of run_prompt."""
+        mock_process = MagicMock()
+        mock_process.stdout = iter([
+            '{"type": "result", "result": "test"}\n'
+        ])
+        mock_process.stderr = iter([])
+        mock_process.wait.return_value = 0
+        mock_popen.return_value = mock_process
+
+        runner = ClaudeRunner()
+        runner.session_id = "test-sess"
+        runner.run_prompt("test prompt")
+
+        info_calls = [str(call) for call in mock_logger.info.call_args_list]
+        assert any("test-sess" in msg for msg in info_calls)

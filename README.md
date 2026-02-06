@@ -1,192 +1,207 @@
 # Prompter
 
-Batch prompt runner for Claude CLI. Automates sequential execution of prompts from a file, maintaining conversation context and saving responses to a JSON report.
+CLI-утилита для автоматизации взаимодействия с Claude Code CLI. Считывает список промптов из файла, последовательно отправляет их в `claude` в режиме headless, поддерживает контекст беседы (session_id) и сохраняет историю ответов в JSON-отчёт.
 
-## Features
+## Установка
 
-- Read prompts from `.txt`, `.md` (separated by `---`) or `.json` files
-- Maintain conversation context via session ID
-- Graceful interruption handling with continue/exit options
-- Flexible configuration via CLI args, config files, or defaults
-- JSON report with timestamps and status for each prompt
-
-## Installation
-
-### Using pipx (recommended)
+### С помощью pipx (рекомендуется)
 
 ```bash
-pipx install git+https://github.com/your-repo/prompter.git
+pipx install .
 ```
 
-### Using Poetry
-
-```bash
-git clone https://github.com/your-repo/prompter.git
-cd prompter
-poetry install
-```
-
-### Development
+### С помощью Poetry
 
 ```bash
 poetry install
-poetry run pytest
+poetry run prompter --help
 ```
 
-## Usage
-
-### Basic Usage
+### Для разработки
 
 ```bash
-# Run prompts from a markdown file
+poetry install
+poetry shell
+prompter --help
+```
+
+## Использование
+
+### Базовый запуск
+
+```bash
 prompter my_prompts.md
-
-# Run with verbose output
-prompter tasks.txt --verbose
-
-# Specify output file
-prompter prompts.json --output results.json
 ```
 
-### Command Line Options
+### С указанием выходного файла
 
-| Option | Short | Description |
-|--------|-------|-------------|
-| `--output` | `-o` | Path for output report JSON file (default: `report.json`) |
-| `--verbose` | `-v` | Enable verbose output with progress information |
-| `--config` | `-c` | Path to config directory |
-| `--app-name` | | Application name for config directory (default: `prompter`) |
-
-### Prompt File Formats
-
-**Text/Markdown (`.txt`, `.md`):**
+```bash
+prompter tasks.txt --output results.json
 ```
-First prompt here
+
+### Verbose режим
+
+```bash
+prompter prompts.txt --verbose
+```
+
+### Полный пример
+
+```bash
+prompter prompts.md \
+    --output ./reports/session_report.json \
+    --timeout 3600 \
+    --verbose \
+    --config ~/.config/prompter
+```
+
+## Аргументы и флаги
+
+| Аргумент/Флаг | Описание |
+|---------------|----------|
+| `INPUT_FILE` | Путь к файлу с промптами (.txt, .md или .json) |
+| `--output`, `-o` | Путь для сохранения JSON-отчёта (по умолчанию: `report.json`) |
+| `--verbose`, `-v` | Включить подробный вывод (DEBUG уровень логирования) |
+| `--timeout`, `-t` | Таймаут в секундах для каждого промпта (по умолчанию: 2400) |
+| `--config`, `-c` | Путь к директории с конфигурацией |
+| `--app-name` | Имя приложения для поиска конфигов (по умолчанию: `prompter`) |
+
+## Форматы входных файлов
+
+### Текстовые файлы (.txt, .md)
+
+Промпты разделяются тремя дефисами (`---`):
+
+```markdown
+Напиши функцию для сортировки списка
 ---
-Second prompt here
+Добавь тесты для этой функции
 ---
-Third prompt here
+Оптимизируй производительность
 ```
 
-**JSON (`.json`):**
+### JSON файлы (.json)
+
+Массив строк:
+
 ```json
 [
-  "First prompt here",
-  "Second prompt here",
-  "Third prompt here"
+    "Напиши функцию для сортировки списка",
+    "Добавь тесты для этой функции",
+    "Оптимизируй производительность"
 ]
 ```
 
-### Interruption Handling
+## Конфигурация
 
-Press `Ctrl+C` during execution to interrupt. You will be prompted:
+### Приоритеты настроек
 
-```
-Interrupted. (N)ext or (E)xit?
-```
+1. **CLI аргументы** (наивысший приоритет)
+2. **Файл конфигурации** (`setting.json`)
+3. **Значения по умолчанию**
 
-- `N` - Skip current prompt and continue to next
-- `E` - Stop execution and save report
+### Поиск директории конфигурации
 
-## Configuration
+Программа ищет конфигурацию в следующем порядке:
 
-### Priority Order
-
-Settings are resolved with the following priority:
-
-1. **CLI arguments** (highest priority)
-2. **Config file** (`setting.json`)
-3. **Default values** (lowest priority)
-
-### Config Directory Locations
-
-The application searches for config in this order:
-
-1. Path specified via `--config` argument
-2. XDG standard path:
-   - Linux/macOS: `~/.config/prompter/`
+1. Путь, указанный через `--config`
+2. XDG-стандарт:
+   - Linux: `~/.config/prompter/`
    - Windows: `%APPDATA%/prompter/`
-3. `.config/` folder in project root (detected by `pyproject.toml`)
+3. Папка `.config/` в корне проекта (определяется по наличию `pyproject.toml`)
 
 ### setting.json
 
-Application settings file.
+Файл настроек приложения:
 
 ```json
 {
-  "verbose": true,
-  "output": "reports/output.json"
+    "verbose": true,
+    "timeout": 3600
 }
 ```
 
 ### logger.json
 
-Custom logging configuration using Python's `dictConfig` format.
+Конфигурация логирования (формат Python `dictConfig`):
 
 ```json
 {
-  "version": 1,
-  "disable_existing_loggers": false,
-  "formatters": {
-    "detailed": {
-      "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    }
-  },
-  "handlers": {
-    "console": {
-      "class": "logging.StreamHandler",
-      "level": "INFO",
-      "formatter": "detailed",
-      "stream": "ext://sys.stdout"
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {
+        "standard": {
+            "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S"
+        },
+        "detailed": {
+            "format": "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s"
+        }
     },
-    "file": {
-      "class": "logging.FileHandler",
-      "level": "DEBUG",
-      "formatter": "detailed",
-      "filename": "prompter.log"
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "level": "INFO",
+            "formatter": "standard",
+            "stream": "ext://sys.stdout"
+        },
+        "file": {
+            "class": "logging.FileHandler",
+            "level": "DEBUG",
+            "formatter": "detailed",
+            "filename": "prompter.log",
+            "encoding": "utf-8"
+        }
+    },
+    "root": {
+        "level": "DEBUG",
+        "handlers": ["console", "file"]
     }
-  },
-  "root": {
-    "level": "DEBUG",
-    "handlers": ["console", "file"]
-  }
 }
 ```
 
-## Output Report
+## Выходной отчёт
 
-The output JSON report contains an array of entries:
+Результаты сохраняются в JSON-файл со следующей структурой:
 
 ```json
 [
-  {
-    "index": 1,
-    "prompt": "Your prompt text",
-    "response": {
-      "session_id": "abc123",
-      "content": "Claude's response..."
+    {
+        "prompt": "Текст промпта",
+        "claude_response": {
+            "type": "result",
+            "result": "Ответ от Claude..."
+        },
+        "timestamp": "2024-01-15T10:30:00.123456",
+        "status": "success"
     },
-    "timestamp": "2024-01-15T10:30:00.123456",
-    "status": "success"
-  },
-  {
-    "index": 2,
-    "prompt": "Second prompt",
-    "response": null,
-    "error": "Error message if failed",
-    "timestamp": "2024-01-15T10:30:05.654321",
-    "status": "error"
-  }
+    {
+        "prompt": "Промпт с ошибкой",
+        "claude_response": null,
+        "timestamp": "2024-01-15T10:31:00.654321",
+        "status": "error",
+        "error": "Описание ошибки"
+    }
 ]
 ```
 
-Status values: `success`, `error`, `interrupted`
+## Обработка прерываний
 
-## Requirements
+При нажатии `Ctrl+C` во время выполнения промпта программа спросит:
+
+```
+Interrupted. (R)epeat, (N)ext or (E)xit?
+```
+
+- `R` — повторить текущий промпт
+- `N` — пропустить текущий промпт и перейти к следующему
+- `E` — завершить выполнение и сохранить отчёт
+
+## Требования
 
 - Python 3.10+
-- Claude CLI installed and configured
+- Claude Code CLI (`claude`) должен быть установлен и доступен в PATH
 
-## License
+## Лицензия
 
 MIT

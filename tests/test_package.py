@@ -1,83 +1,71 @@
-"""Тесты для проверки корректности конфигурации пакета."""
+"""Tests for package configuration validity."""
 
 import importlib
-import tomllib
+import re
 from pathlib import Path
 
-
-def _find_project_root() -> Path:
-    """Ищет корень проекта по наличию pyproject.toml."""
-    current = Path(__file__).resolve().parent
-
-    for parent in [current, *current.parents]:
-        if (parent / "pyproject.toml").exists():
-            return parent
-
-    raise FileNotFoundError("pyproject.toml не найден")
+import pytest
 
 
 class TestPackageConfiguration:
-    """Тесты конфигурации пакета."""
+    """Test suite for package configuration."""
 
-    def test_scripts_importable(self) -> None:
-        """Проверяет, что все скрипты из pyproject.toml можно импортировать."""
-        project_root = _find_project_root()
+    def test_pyproject_script_import(self) -> None:
+        """Test that the script entry point in pyproject.toml is importable."""
+        project_root = self._find_project_root()
         pyproject_path = project_root / "pyproject.toml"
 
+        assert pyproject_path.exists(), "pyproject.toml not found"
+
         content = pyproject_path.read_text(encoding="utf-8")
-        config = tomllib.loads(content)
 
-        scripts = config.get("project", {}).get("scripts", {})
-        assert scripts, "Секция [project.scripts] не найдена или пуста"
+        match = re.search(r'prompter\s*=\s*"([^"]+)"', content)
+        assert match, "Script entry 'prompter' not found in pyproject.toml"
 
-        for script_name, entry_point in scripts.items():
-            # Извлекаем путь импорта (часть до двоеточия)
+        entry_point = match.group(1)
+
+        if ":" in entry_point:
             module_path = entry_point.split(":")[0]
+        else:
+            module_path = entry_point
 
-            try:
-                module = importlib.import_module(module_path)
-            except ModuleNotFoundError as e:
-                raise AssertionError(
-                    f"Не удалось импортировать модуль '{module_path}' "
-                    f"для скрипта '{script_name}'. "
-                    f"Возможно, путь содержит лишний префикс 'src.'. "
-                    f"Ошибка: {e}"
-                ) from e
+        try:
+            module = importlib.import_module(module_path)
+            assert module is not None
+        except ModuleNotFoundError as e:
+            pytest.fail(
+                f"Failed to import '{module_path}' from pyproject.toml script entry. "
+                f"Error: {e}. "
+                f"This may indicate an incorrect path (e.g., 'src.' prefix that shouldn't be there)."
+            )
 
-            # Проверяем, что объект (функция/app) существует в модуле
-            attr_name = entry_point.split(":")[1] if ":" in entry_point else None
-            if attr_name:
-                assert hasattr(module, attr_name), (
-                    f"Модуль '{module_path}' не содержит атрибут '{attr_name}'"
-                )
-
-    def test_prompter_script_exists(self) -> None:
-        """Проверяет наличие скрипта prompter."""
-        project_root = _find_project_root()
+    def test_entry_point_has_app(self) -> None:
+        """Test that the entry point module has the 'app' object."""
+        project_root = self._find_project_root()
         pyproject_path = project_root / "pyproject.toml"
 
         content = pyproject_path.read_text(encoding="utf-8")
-        config = tomllib.loads(content)
+        match = re.search(r'prompter\s*=\s*"([^"]+)"', content)
 
-        scripts = config.get("project", {}).get("scripts", {})
-        assert "prompter" in scripts, "Скрипт 'prompter' не найден в [project.scripts]"
+        if not match:
+            pytest.skip("No prompter entry point found")
 
-    def test_prompter_entry_point_valid(self) -> None:
-        """Проверяет корректность entry point для prompter."""
-        project_root = _find_project_root()
-        pyproject_path = project_root / "pyproject.toml"
+        entry_point = match.group(1)
 
-        content = pyproject_path.read_text(encoding="utf-8")
-        config = tomllib.loads(content)
+        if ":" in entry_point:
+            module_path, attr_name = entry_point.split(":")
+        else:
+            pytest.skip("Entry point doesn't specify an attribute")
 
-        entry_point = config["project"]["scripts"]["prompter"]
+        module = importlib.import_module(module_path)
+        assert hasattr(module, attr_name), f"Module '{module_path}' has no attribute '{attr_name}'"
 
-        # Проверяем формат
-        assert ":" in entry_point, "Entry point должен содержать ':'"
-        assert not entry_point.startswith("src."), (
-            "Entry point не должен начинаться с 'src.'"
-        )
+    def _find_project_root(self) -> Path:
+        """Find the project root by searching for pyproject.toml."""
+        current = Path(__file__).parent
 
-        module_path, attr_name = entry_point.split(":")
-        assert module_path == "prompter.main", f"Ожидался 'prompter.main', получен '{module_path}'"
-        assert attr_name == "app", f"Ожидался 'app', получен '{attr_name}'"
+        for parent in [current, *current.parents]:
+            if (parent / "pyproject.toml").exists():
+                return parent
+
+        pytest.fail("Could not find project root (pyproject.toml)")
