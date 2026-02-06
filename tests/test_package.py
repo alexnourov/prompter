@@ -7,65 +7,66 @@ from pathlib import Path
 import pytest
 
 
-class TestPackageConfiguration:
+class TestPackageConfig:
     """Test suite for package configuration."""
 
     def test_pyproject_script_import(self) -> None:
-        """Test that the script entry point in pyproject.toml is importable."""
-        project_root = self._find_project_root()
-        pyproject_path = project_root / "pyproject.toml"
+        """Test that the script entry point in pyproject.toml is importable.
 
-        assert pyproject_path.exists(), "pyproject.toml not found"
+        This test ensures that the package is correctly configured for
+        installation - the import path should not contain 'src.' prefix.
+        """
+        pyproject_path = self._find_pyproject()
+        assert pyproject_path is not None, "pyproject.toml not found"
 
         content = pyproject_path.read_text(encoding="utf-8")
 
         match = re.search(r'prompter\s*=\s*"([^"]+)"', content)
-        assert match, "Script entry 'prompter' not found in pyproject.toml"
+        assert match is not None, "Script entry 'prompter' not found in pyproject.toml"
 
         entry_point = match.group(1)
+        module_path = entry_point.split(":")[0]
 
-        if ":" in entry_point:
-            module_path = entry_point.split(":")[0]
-        else:
-            module_path = entry_point
+        assert not module_path.startswith("src."), (
+            f"Module path should not start with 'src.': {module_path}"
+        )
 
         try:
             module = importlib.import_module(module_path)
             assert module is not None
         except ModuleNotFoundError as e:
             pytest.fail(
-                f"Failed to import '{module_path}' from pyproject.toml script entry. "
-                f"Error: {e}. "
-                f"This may indicate an incorrect path (e.g., 'src.' prefix that shouldn't be there)."
+                f"Failed to import module '{module_path}' from pyproject.toml: {e}"
             )
 
-    def test_entry_point_has_app(self) -> None:
-        """Test that the entry point module has the 'app' object."""
-        project_root = self._find_project_root()
-        pyproject_path = project_root / "pyproject.toml"
+    def test_app_object_exists(self) -> None:
+        """Test that the app object exists in the main module."""
+        pyproject_path = self._find_pyproject()
+        assert pyproject_path is not None
 
         content = pyproject_path.read_text(encoding="utf-8")
         match = re.search(r'prompter\s*=\s*"([^"]+)"', content)
-
-        if not match:
-            pytest.skip("No prompter entry point found")
+        assert match is not None
 
         entry_point = match.group(1)
-
-        if ":" in entry_point:
-            module_path, attr_name = entry_point.split(":")
-        else:
-            pytest.skip("Entry point doesn't specify an attribute")
+        module_path, obj_name = entry_point.split(":")
 
         module = importlib.import_module(module_path)
-        assert hasattr(module, attr_name), f"Module '{module_path}' has no attribute '{attr_name}'"
+        assert hasattr(module, obj_name), (
+            f"Object '{obj_name}' not found in module '{module_path}'"
+        )
 
-    def _find_project_root(self) -> Path:
-        """Find the project root by searching for pyproject.toml."""
-        current = Path(__file__).parent
+    def _find_pyproject(self) -> Path | None:
+        """Find pyproject.toml by traversing up from current directory.
+
+        Returns:
+            Path to pyproject.toml or None if not found.
+        """
+        current = Path(__file__).resolve().parent
 
         for parent in [current, *current.parents]:
-            if (parent / "pyproject.toml").exists():
-                return parent
+            pyproject = parent / "pyproject.toml"
+            if pyproject.exists():
+                return pyproject
 
-        pytest.fail("Could not find project root (pyproject.toml)")
+        return None

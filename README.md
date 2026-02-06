@@ -1,207 +1,205 @@
 # Prompter
 
-CLI-утилита для автоматизации взаимодействия с Claude Code CLI. Считывает список промптов из файла, последовательно отправляет их в `claude` в режиме headless, поддерживает контекст беседы (session_id) и сохраняет историю ответов в JSON-отчёт.
+CLI utility for automating interaction with Claude Code CLI. Prompter reads prompts from a file, sequentially sends them to `claude` in headless mode, maintains conversation context (session_id), and saves response history to a JSON report.
 
-## Установка
+## Installation
 
-### С помощью pipx (рекомендуется)
+### Using pipx (recommended)
 
 ```bash
-pipx install .
+pipx install prompter
 ```
 
-### С помощью Poetry
+### Using Poetry
 
 ```bash
+git clone <repository-url>
+cd prompter
 poetry install
-poetry run prompter --help
 ```
 
-### Для разработки
+### From source
 
 ```bash
-poetry install
-poetry shell
-prompter --help
+pip install .
 ```
 
-## Использование
+## Usage
 
-### Базовый запуск
+### Basic usage
 
 ```bash
-prompter my_prompts.md
+prompter prompts.txt
 ```
 
-### С указанием выходного файла
+### With options
 
 ```bash
-prompter tasks.txt --output results.json
+prompter prompts.md --verbose --output results.json
+prompter tasks.txt -v -o report.json --timeout 3600
+prompter prompts.json --config ~/.config/my-prompter
 ```
 
-### Verbose режим
+### Command-line options
 
-```bash
-prompter prompts.txt --verbose
-```
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `--output` | `-o` | Path to save the output report (JSON) | `report.json` |
+| `--verbose` | `-v` | Enable verbose output | `false` |
+| `--timeout` | `-t` | Timeout in seconds for each prompt | `2400` |
+| `--config` | `-c` | Path to custom config directory | Auto-detected |
+| `--app-name` | | Application name for config directory | `prompter` |
+| `--version` | | Show version and exit | |
+| `--help` | | Show help message | |
 
-### Полный пример
+### Input file formats
 
-```bash
-prompter prompts.md \
-    --output ./reports/session_report.json \
-    --timeout 3600 \
-    --verbose \
-    --config ~/.config/prompter
-```
+**Text/Markdown (.txt, .md)**
 
-## Аргументы и флаги
+Prompts are separated by `---` on its own line:
 
-| Аргумент/Флаг | Описание |
-|---------------|----------|
-| `INPUT_FILE` | Путь к файлу с промптами (.txt, .md или .json) |
-| `--output`, `-o` | Путь для сохранения JSON-отчёта (по умолчанию: `report.json`) |
-| `--verbose`, `-v` | Включить подробный вывод (DEBUG уровень логирования) |
-| `--timeout`, `-t` | Таймаут в секундах для каждого промпта (по умолчанию: 2400) |
-| `--config`, `-c` | Путь к директории с конфигурацией |
-| `--app-name` | Имя приложения для поиска конфигов (по умолчанию: `prompter`) |
-
-## Форматы входных файлов
-
-### Текстовые файлы (.txt, .md)
-
-Промпты разделяются тремя дефисами (`---`):
-
-```markdown
-Напиши функцию для сортировки списка
+```text
+First prompt here
 ---
-Добавь тесты для этой функции
+Second prompt here
 ---
-Оптимизируй производительность
+Third prompt here
 ```
 
-### JSON файлы (.json)
+**JSON (.json)**
 
-Массив строк:
+Array of strings:
 
 ```json
 [
-    "Напиши функцию для сортировки списка",
-    "Добавь тесты для этой функции",
-    "Оптимизируй производительность"
+  "First prompt here",
+  "Second prompt here",
+  "Third prompt here"
 ]
 ```
 
-## Конфигурация
+### Interrupt handling
 
-### Приоритеты настроек
+During execution, press `Ctrl+C` to interrupt. You will be prompted:
 
-1. **CLI аргументы** (наивысший приоритет)
-2. **Файл конфигурации** (`setting.json`)
-3. **Значения по умолчанию**
+- `R` - Repeat the current prompt
+- `N` - Skip to the next prompt
+- `E` - Exit and save current results
 
-### Поиск директории конфигурации
+## Configuration
 
-Программа ищет конфигурацию в следующем порядке:
+### Priority order
 
-1. Путь, указанный через `--config`
-2. XDG-стандарт:
+Settings are resolved in the following order (highest to lowest priority):
+
+1. **CLI arguments** - Command-line flags override everything
+2. **Config file** - `setting.json` in config directory
+3. **Defaults** - Built-in default values
+
+### Config directory locations
+
+Prompter searches for configuration in the following order:
+
+1. **Explicit path** - If `--config` is provided
+2. **XDG standard**:
    - Linux: `~/.config/prompter/`
    - Windows: `%APPDATA%/prompter/`
-3. Папка `.config/` в корне проекта (определяется по наличию `pyproject.toml`)
+3. **Project directory** - `.config/` folder in project root (found by `pyproject.toml`)
 
-### setting.json
+### Configuration files
 
-Файл настроек приложения:
+#### setting.json
+
+Application settings:
 
 ```json
 {
-    "verbose": true,
-    "timeout": 3600
+  "verbose": true,
+  "timeout": 3600
 }
 ```
 
-### logger.json
+#### logger.json
 
-Конфигурация логирования (формат Python `dictConfig`):
+Custom logging configuration (Python dictConfig format):
 
 ```json
 {
-    "version": 1,
-    "disable_existing_loggers": false,
-    "formatters": {
-        "standard": {
-            "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            "datefmt": "%Y-%m-%d %H:%M:%S"
-        },
-        "detailed": {
-            "format": "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s"
-        }
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "standard": {
+      "format": "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
     },
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "level": "INFO",
-            "formatter": "standard",
-            "stream": "ext://sys.stdout"
-        },
-        "file": {
-            "class": "logging.FileHandler",
-            "level": "DEBUG",
-            "formatter": "detailed",
-            "filename": "prompter.log",
-            "encoding": "utf-8"
-        }
-    },
-    "root": {
-        "level": "DEBUG",
-        "handlers": ["console", "file"]
+    "simple": {
+      "format": "%(asctime)s - %(message)s"
     }
+  },
+  "handlers": {
+    "console": {
+      "class": "logging.StreamHandler",
+      "level": "INFO",
+      "formatter": "simple",
+      "stream": "ext://sys.stdout"
+    },
+    "file": {
+      "class": "logging.FileHandler",
+      "level": "DEBUG",
+      "formatter": "standard",
+      "filename": "prompter.log"
+    }
+  },
+  "root": {
+    "level": "DEBUG",
+    "handlers": ["console", "file"]
+  }
 }
 ```
 
-## Выходной отчёт
+When using `logger.json`:
+- Console handler level is set to `DEBUG` with `--verbose`, otherwise `INFO`
+- File handler level is always `DEBUG`
+- Root logger level is always `DEBUG`
 
-Результаты сохраняются в JSON-файл со следующей структурой:
+If no `logger.json` is found, Prompter uses basic logging with:
+- Console output: `INFO` level (or `DEBUG` with `--verbose`)
+- File output: `DEBUG` level to `prompter.log`
+
+## Output report
+
+Results are saved as a JSON array:
 
 ```json
 [
-    {
-        "prompt": "Текст промпта",
-        "claude_response": {
-            "type": "result",
-            "result": "Ответ от Claude..."
-        },
-        "timestamp": "2024-01-15T10:30:00.123456",
-        "status": "success"
+  {
+    "prompt": "First prompt text",
+    "claude_response": {
+      "type": "result",
+      "result": "Claude's response..."
     },
-    {
-        "prompt": "Промпт с ошибкой",
-        "claude_response": null,
-        "timestamp": "2024-01-15T10:31:00.654321",
-        "status": "error",
-        "error": "Описание ошибки"
-    }
+    "timestamp": "2024-01-15T10:30:00.123456",
+    "status": "success"
+  },
+  {
+    "prompt": "Second prompt text",
+    "claude_response": null,
+    "timestamp": "2024-01-15T10:31:00.654321",
+    "status": "error",
+    "error": "Error message"
+  }
 ]
 ```
 
-## Обработка прерываний
+Status values:
+- `success` - Prompt completed successfully
+- `error` - Prompt failed with an error
+- `skipped` - Prompt was skipped by user (Ctrl+C -> N)
 
-При нажатии `Ctrl+C` во время выполнения промпта программа спросит:
-
-```
-Interrupted. (R)epeat, (N)ext or (E)xit?
-```
-
-- `R` — повторить текущий промпт
-- `N` — пропустить текущий промпт и перейти к следующему
-- `E` — завершить выполнение и сохранить отчёт
-
-## Требования
+## Requirements
 
 - Python 3.10+
-- Claude Code CLI (`claude`) должен быть установлен и доступен в PATH
+- Claude Code CLI (`claude`) installed and configured
 
-## Лицензия
+## License
 
 MIT

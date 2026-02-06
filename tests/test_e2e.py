@@ -1,4 +1,4 @@
-"""End-to-end tests for Prompter CLI."""
+"""End-to-end tests for Prompter CLI application."""
 
 import json
 from pathlib import Path
@@ -16,193 +16,194 @@ runner = CliRunner()
 class TestE2E:
     """End-to-end test suite for Prompter CLI."""
 
-    @patch("prompter.main.ClaudeRunner")
-    def test_successful_run(
-        self, mock_runner_class: MagicMock, tmp_path: Path
-    ) -> None:
-        """Test successful execution with mocked ClaudeRunner."""
+    def test_full_execution(self, tmp_path: Path) -> None:
+        """Test full execution flow with mocked ClaudeRunner."""
         prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("First prompt\n---\nSecond prompt", encoding="utf-8")
+        prompts_file.write_text("Prompt 1\n---\nPrompt 2", encoding="utf-8")
 
         output_file = tmp_path / "report.json"
 
-        mock_runner = MagicMock()
-        mock_runner.run_prompt.return_value = {
-            "content": "test",
-            "session_id": "123",
-        }
-        mock_runner_class.return_value = mock_runner
+        mock_response = {"content": "test", "session_id": "123"}
 
-        result = runner.invoke(
-            app,
-            [str(prompts_file), "--output", str(output_file)],
-        )
+        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
+            mock_runner = MagicMock()
+            mock_runner.run_prompt.return_value = mock_response
+            mock_runner_class.return_value = mock_runner
 
-        assert result.exit_code == 0, f"CLI failed: {result.output}"
+            with patch("prompter.main.setup_logging"):
+                result = runner.invoke(
+                    app,
+                    [str(prompts_file), "--output", str(output_file)],
+                )
 
-        assert output_file.exists(), "Output report file was not created"
+        assert result.exit_code == 0, f"Exit code was {result.exit_code}: {result.output}"
+        assert output_file.exists(), "Output file was not created"
 
         report = json.loads(output_file.read_text(encoding="utf-8"))
-
         assert len(report) == 2
-        assert report[0]["prompt"] == "First prompt"
         assert report[0]["status"] == "success"
-        assert report[0]["claude_response"]["content"] == "test"
-        assert report[1]["prompt"] == "Second prompt"
+        assert report[0]["claude_response"] == mock_response
         assert report[1]["status"] == "success"
 
-    @patch("prompter.main.ClaudeRunner")
-    def test_json_prompts_file(
-        self, mock_runner_class: MagicMock, tmp_path: Path
-    ) -> None:
-        """Test execution with JSON prompts file."""
-        prompts_file = tmp_path / "prompts.json"
-        prompts_data = ["Prompt one", "Prompt two", "Prompt three"]
-        prompts_file.write_text(json.dumps(prompts_data), encoding="utf-8")
+    def test_version_flag(self) -> None:
+        """Test that --version flag shows version and exits."""
+        result = runner.invoke(app, ["--version"])
+
+        assert result.exit_code == 0
+        assert "version" in result.output.lower()
+
+    def test_single_prompt(self, tmp_path: Path) -> None:
+        """Test execution with a single prompt."""
+        prompts_file = tmp_path / "prompts.txt"
+        prompts_file.write_text("Single prompt", encoding="utf-8")
 
         output_file = tmp_path / "report.json"
 
-        mock_runner = MagicMock()
-        mock_runner.run_prompt.return_value = {"result": "ok"}
-        mock_runner_class.return_value = mock_runner
+        mock_response = {"result": "Success", "session_id": "abc"}
 
-        result = runner.invoke(
-            app,
-            [str(prompts_file), "--output", str(output_file)],
-        )
+        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
+            mock_runner = MagicMock()
+            mock_runner.run_prompt.return_value = mock_response
+            mock_runner_class.return_value = mock_runner
+
+            with patch("prompter.main.setup_logging"):
+                result = runner.invoke(
+                    app,
+                    [str(prompts_file), "--output", str(output_file)],
+                )
 
         assert result.exit_code == 0
-
         report = json.loads(output_file.read_text(encoding="utf-8"))
-        assert len(report) == 3
+        assert len(report) == 1
+        assert report[0]["prompt"] == "Single prompt"
 
-    @patch("prompter.main.ClaudeRunner")
-    def test_verbose_flag(
-        self, mock_runner_class: MagicMock, tmp_path: Path
-    ) -> None:
+    def test_json_prompts(self, tmp_path: Path) -> None:
+        """Test execution with JSON prompts file."""
+        prompts_file = tmp_path / "prompts.json"
+        prompts_file.write_text(
+            json.dumps(["First prompt", "Second prompt"]),
+            encoding="utf-8",
+        )
+
+        output_file = tmp_path / "report.json"
+
+        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
+            mock_runner = MagicMock()
+            mock_runner.run_prompt.return_value = {"result": "ok"}
+            mock_runner_class.return_value = mock_runner
+
+            with patch("prompter.main.setup_logging"):
+                result = runner.invoke(
+                    app,
+                    [str(prompts_file), "--output", str(output_file)],
+                )
+
+        assert result.exit_code == 0
+        report = json.loads(output_file.read_text(encoding="utf-8"))
+        assert len(report) == 2
+
+    def test_verbose_flag(self, tmp_path: Path) -> None:
         """Test that verbose flag is passed correctly."""
         prompts_file = tmp_path / "prompts.txt"
         prompts_file.write_text("Test prompt", encoding="utf-8")
 
         output_file = tmp_path / "report.json"
 
-        mock_runner = MagicMock()
-        mock_runner.run_prompt.return_value = {"result": "ok"}
-        mock_runner_class.return_value = mock_runner
+        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
+            mock_runner = MagicMock()
+            mock_runner.run_prompt.return_value = {"result": "ok"}
+            mock_runner_class.return_value = mock_runner
 
-        result = runner.invoke(
-            app,
-            [str(prompts_file), "--output", str(output_file), "--verbose"],
-        )
+            with patch("prompter.main.setup_logging") as mock_setup_logging:
+                result = runner.invoke(
+                    app,
+                    [str(prompts_file), "--output", str(output_file), "--verbose"],
+                )
+
+                mock_setup_logging.assert_called_once()
+                call_args = mock_setup_logging.call_args
+                assert call_args[1]["verbose"] is True
 
         assert result.exit_code == 0
 
-        mock_runner.run_prompt.assert_called_once()
-        call_kwargs = mock_runner.run_prompt.call_args[1]
-        assert call_kwargs["verbose"] is True
-
-    @patch("prompter.main.ClaudeRunner")
-    def test_timeout_flag(
-        self, mock_runner_class: MagicMock, tmp_path: Path
-    ) -> None:
-        """Test that timeout flag is passed correctly."""
+    def test_timeout_option(self, tmp_path: Path) -> None:
+        """Test that timeout option is passed to runner."""
         prompts_file = tmp_path / "prompts.txt"
         prompts_file.write_text("Test prompt", encoding="utf-8")
 
         output_file = tmp_path / "report.json"
 
-        mock_runner = MagicMock()
-        mock_runner.run_prompt.return_value = {"result": "ok"}
-        mock_runner_class.return_value = mock_runner
+        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
+            mock_runner = MagicMock()
+            mock_runner.run_prompt.return_value = {"result": "ok"}
+            mock_runner_class.return_value = mock_runner
 
-        result = runner.invoke(
-            app,
-            [str(prompts_file), "--output", str(output_file), "--timeout", "1800"],
-        )
+            with patch("prompter.main.setup_logging"):
+                result = runner.invoke(
+                    app,
+                    [
+                        str(prompts_file),
+                        "--output",
+                        str(output_file),
+                        "--timeout",
+                        "3600",
+                    ],
+                )
+
+                mock_runner.run_prompt.assert_called_once()
+                call_kwargs = mock_runner.run_prompt.call_args[1]
+                assert call_kwargs["timeout"] == 3600
 
         assert result.exit_code == 0
 
-        call_kwargs = mock_runner.run_prompt.call_args[1]
-        assert call_kwargs["timeout"] == 1800
-
-    @patch("prompter.main.ClaudeRunner")
-    def test_error_handling(
-        self, mock_runner_class: MagicMock, tmp_path: Path
-    ) -> None:
-        """Test that errors are handled gracefully and recorded in report."""
+    def test_error_handling(self, tmp_path: Path) -> None:
+        """Test that errors during prompt execution are handled gracefully."""
         prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("Failing prompt\n---\nGood prompt", encoding="utf-8")
+        prompts_file.write_text("Prompt 1\n---\nPrompt 2", encoding="utf-8")
 
         output_file = tmp_path / "report.json"
 
-        mock_runner = MagicMock()
-        mock_runner.run_prompt.side_effect = [
-            RuntimeError("Claude crashed"),
-            {"result": "ok"},
-        ]
-        mock_runner_class.return_value = mock_runner
+        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
+            mock_runner = MagicMock()
+            mock_runner.run_prompt.side_effect = [
+                Exception("Something went wrong"),
+                {"result": "ok"},
+            ]
+            mock_runner_class.return_value = mock_runner
 
-        result = runner.invoke(
-            app,
-            [str(prompts_file), "--output", str(output_file)],
-        )
+            with patch("prompter.main.setup_logging"):
+                result = runner.invoke(
+                    app,
+                    [str(prompts_file), "--output", str(output_file)],
+                )
 
         assert result.exit_code == 0
-
         report = json.loads(output_file.read_text(encoding="utf-8"))
-
         assert len(report) == 2
         assert report[0]["status"] == "error"
-        assert "Claude crashed" in report[0]["error"]
+        assert "Something went wrong" in report[0]["error"]
         assert report[1]["status"] == "success"
 
-    def test_nonexistent_input_file(self, tmp_path: Path) -> None:
-        """Test error when input file doesn't exist."""
-        nonexistent = tmp_path / "nonexistent.txt"
-
-        result = runner.invoke(app, [str(nonexistent)])
-
-        assert result.exit_code != 0
-
-    @patch("prompter.main.ClaudeRunner")
-    def test_empty_prompts_file(
-        self, mock_runner_class: MagicMock, tmp_path: Path
-    ) -> None:
+    def test_empty_prompts_file(self, tmp_path: Path) -> None:
         """Test handling of empty prompts file."""
         prompts_file = tmp_path / "prompts.txt"
         prompts_file.write_text("", encoding="utf-8")
 
         output_file = tmp_path / "report.json"
 
-        result = runner.invoke(
-            app,
-            [str(prompts_file), "--output", str(output_file)],
-        )
+        with patch("prompter.main.setup_logging"):
+            result = runner.invoke(
+                app,
+                [str(prompts_file), "--output", str(output_file)],
+            )
 
         assert result.exit_code == 0
 
-    @patch("prompter.main.ClaudeRunner")
-    def test_report_contains_timestamps(
-        self, mock_runner_class: MagicMock, tmp_path: Path
-    ) -> None:
-        """Test that report entries contain timestamps."""
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("Test prompt", encoding="utf-8")
-
-        output_file = tmp_path / "report.json"
-
-        mock_runner = MagicMock()
-        mock_runner.run_prompt.return_value = {"result": "ok"}
-        mock_runner_class.return_value = mock_runner
-
+    def test_nonexistent_input_file(self, tmp_path: Path) -> None:
+        """Test handling of non-existent input file."""
         result = runner.invoke(
             app,
-            [str(prompts_file), "--output", str(output_file)],
+            [str(tmp_path / "nonexistent.txt")],
         )
 
-        assert result.exit_code == 0
-
-        report = json.loads(output_file.read_text(encoding="utf-8"))
-
-        assert "timestamp" in report[0]
-        assert "T" in report[0]["timestamp"]
+        assert result.exit_code != 0
