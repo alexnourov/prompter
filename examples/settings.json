@@ -1,0 +1,6 @@
+{
+  "verbose": false,
+  "timeout": 3600,
+  "output": "results.json",
+  "source_encoding": null
+}

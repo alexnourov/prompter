@@ -1,198 +1,174 @@
-"""Configuration module for Prompter application."""
+"""Configuration management for Prompter.
+
+This module handles:
+- Finding configuration directories across different OS platforms
+- Loading settings from JSON files
+- Merging CLI arguments with settings and defaults
+"""
 
 import json
 import logging
-import logging.config
 import os
 import platform
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-def find_config_dir(app_name: str, config_arg: Path | None = None) -> Path:
-    """Determine the configuration directory path.
+def find_config_dir(app_name: str, config_override: Path | None = None) -> Path | None:
+    """Find configuration directory using priority-based search.
 
-    Priority order:
-    1. Explicit config_arg if provided
-    2. XDG standard (~/.config/<app_name> on Linux, %APPDATA%/<app_name> on Windows)
-    3. .config folder in project root (found by locating pyproject.toml)
-
-    Args:
-        app_name: Application name for the config directory.
-        config_arg: Explicit path to config directory (highest priority).
-
-    Returns:
-        Path to the configuration directory.
-    """
-    if config_arg is not None:
-        return config_arg
-
-    xdg_config = _get_xdg_config_dir(app_name)
-    if xdg_config.exists():
-        return xdg_config
-
-    project_config = _find_project_config_dir()
-    if project_config is not None and project_config.exists():
-        return project_config
-
-    return xdg_config
-
-
-def _get_xdg_config_dir(app_name: str) -> Path:
-    """Get XDG-compliant config directory.
+    Priority order (CFG-02):
+    1. Explicit override (raises SystemExit if doesn't exist)
+    2. OS-specific standard locations
+    3. Project root .config directory (fallback)
+    4. None if nothing found
 
     Args:
-        app_name: Application name for the config directory.
+        app_name: Application name for config directory
+        config_override: Optional explicit path to config directory
 
     Returns:
-        Path to XDG config directory.
+        Path to config directory, or None if not found
+
+    Raises:
+        SystemExit: If config_override is specified but doesn't exist
     """
+    # Priority 1: Explicit override
+    if config_override is not None:
+        if not config_override.is_dir():
+            raise SystemExit(f"Config directory does not exist: {config_override}")
+        return Path(config_override)
+
+    # Priority 2: OS-specific standard locations
     system = platform.system()
 
-    if system == "Windows":
+    if system == "Linux":
+        # Linux: $XDG_CONFIG_HOME/app_name or ~/.config/app_name
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(xdg) if xdg else Path.home() / ".config"
+        candidate = base / app_name
+        if candidate.is_dir():
+            return candidate
+
+    elif system == "Darwin":
+        # macOS: ~/Library/Application Support/app_name
+        base = Path.home() / "Library" / "Application Support"
+        candidate = base / app_name
+        if candidate.is_dir():
+            return candidate
+
+    elif system == "Windows":
+        # Windows: %APPDATA%/app_name
         appdata = os.environ.get("APPDATA")
         if appdata:
-            return Path(appdata) / app_name
-        return Path.home() / "AppData" / "Roaming" / app_name
+            base = Path(appdata)
+            candidate = base / app_name
+            if candidate.is_dir():
+                return candidate
 
-    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
-    if xdg_config_home:
-        return Path(xdg_config_home) / app_name
-
-    return Path.home() / ".config" / app_name
-
-
-def _find_project_config_dir() -> Path | None:
-    """Find .config directory in project root.
-
-    Searches for pyproject.toml by traversing up from current directory.
-
-    Returns:
-        Path to .config in project root, or None if not found.
-    """
+    # Priority 3: Fallback to .config in project root (CFG-05)
+    # Find project root by looking for pyproject.toml
     current = Path.cwd()
+    for parent in [current] + list(current.parents):
+        if (parent / "pyproject.toml").exists():
+            # Found project root
+            config_candidate = parent / ".config"
+            if config_candidate.is_dir():
+                return config_candidate
+            break
 
-    for parent in [current, *current.parents]:
-        pyproject = parent / "pyproject.toml"
-        if pyproject.exists():
-            return parent / ".config"
-
+    # Priority 4: Nothing found
     return None
 
 
-def load_settings(config_dir: Path) -> dict[str, Any]:
-    """Load application settings from config directory.
+def load_settings(config_dir: Path) -> dict:
+    """Load settings from settings.json in config directory.
 
     Args:
-        config_dir: Path to the configuration directory.
+        config_dir: Path to configuration directory
 
     Returns:
-        Dictionary of settings, or empty dict if file not found or invalid.
-    """
-    settings_file = config_dir / "setting.json"
+        Dictionary of settings, or empty dict if file not found or invalid
 
-    if not settings_file.exists():
-        logger.debug("Settings file not found: %s", settings_file)
-        return {}
+    File format (CFG-06):
+        - JSON object with configuration keys
+        - UTF-8 encoding
+        - Missing or invalid file returns empty dict (not an error)
+    """
+    settings_file = config_dir / "settings.json"
 
     try:
-        content = settings_file.read_text(encoding="utf-8")
-        settings = json.loads(content)
-        logger.debug("Loaded settings from %s", settings_file)
+        with open(settings_file, encoding="utf-8") as f:
+            settings = json.load(f)
+
+        if not isinstance(settings, dict):
+            logger.warning(f"settings.json is not a JSON object, ignoring")
+            return {}
+
         return settings
+
+    except FileNotFoundError:
+        # Not an error - just no settings file
+        return {}
+
     except json.JSONDecodeError as e:
-        logger.warning("Failed to parse settings file: %s", e)
-        return {}
-    except OSError as e:
-        logger.warning("Failed to read settings file: %s", e)
+        logger.warning(f"Invalid JSON in settings.json: {e}. Ignoring settings.")
         return {}
 
-
-def setup_logging(config_dir: Path, verbose: bool = False) -> None:
-    """Configure logging for the application.
-
-    If logger.json exists in config_dir, uses dictConfig with modified levels.
-    Otherwise, sets up basic logging with console and file handlers.
-
-    Args:
-        config_dir: Path to the configuration directory.
-        verbose: If True, set console handler to DEBUG level.
-    """
-    logger_config_file = config_dir / "logger.json"
-
-    if logger_config_file.exists():
-        _setup_logging_from_file(logger_config_file, verbose)
-    else:
-        _setup_logging_fallback(config_dir, verbose)
+    except Exception as e:
+        logger.warning(f"Error reading settings.json: {e}. Ignoring settings.")
+        return {}
 
 
-def _setup_logging_from_file(config_file: Path, verbose: bool) -> None:
-    """Configure logging from JSON config file.
+def merge_config(cli_args: dict, settings: dict, defaults: dict) -> dict:
+    """Merge configuration from CLI args, settings file, and defaults.
+
+    Priority order (CFG-07):
+    1. CLI arguments (if explicitly provided, not None)
+    2. Settings from settings.json
+    3. Default values
+
+    Type validation:
+    - For keys with non-None defaults: validate type matches default type
+    - For keys with None defaults: skip type validation (accept any type)
+    - Invalid types log WARNING and use default
 
     Args:
-        config_file: Path to logger.json file.
-        verbose: If True, set console handler to DEBUG level.
+        cli_args: Arguments from command line (may contain None for unspecified)
+        settings: Settings loaded from settings.json
+        defaults: Default values for all configuration keys
+
+    Returns:
+        Merged configuration dictionary
     """
-    try:
-        content = config_file.read_text(encoding="utf-8")
-        config = json.loads(content)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"Warning: Failed to load logger config: {e}")
-        _setup_logging_fallback(config_file.parent, verbose)
-        return
+    merged = {}
 
-    handlers = config.get("handlers", {})
-    for handler_name, handler_config in handlers.items():
-        handler_name_lower = handler_name.lower()
-        handler_class = handler_config.get("class", "").lower()
+    for key in defaults:
+        # Priority 1: CLI argument explicitly provided
+        if cli_args.get(key) is not None:
+            merged[key] = cli_args[key]
 
-        is_console = (
-            "console" in handler_name_lower
-            or "stream" in handler_name_lower
-            or "streamhandler" in handler_class
-        )
-        is_file = (
-            "file" in handler_name_lower
-            or "filehandler" in handler_class
-        )
+        # Priority 2: Setting from settings.json
+        elif key in settings:
+            # Type validation (skip for None-default keys like source_encoding)
+            if defaults[key] is None:
+                # None-default: accept any type without validation
+                merged[key] = settings[key]
+            elif not isinstance(settings[key], type(defaults[key])):
+                # Type mismatch: log warning and use default
+                logger.warning(
+                    f"Invalid type for '{key}' in settings.json: "
+                    f"expected {type(defaults[key]).__name__}, "
+                    f"got {type(settings[key]).__name__}. Using default."
+                )
+                merged[key] = defaults[key]
+            else:
+                # Type matches: use setting
+                merged[key] = settings[key]
 
-        if is_console:
-            handler_config["level"] = "DEBUG" if verbose else "INFO"
-        elif is_file:
-            handler_config["level"] = "DEBUG"
+        # Priority 3: Default value
+        else:
+            merged[key] = defaults[key]
 
-    if "root" in config:
-        config["root"]["level"] = "DEBUG"
-
-    logging.config.dictConfig(config)
-
-
-def _setup_logging_fallback(config_dir: Path, verbose: bool) -> None:
-    """Configure basic logging when no config file exists.
-
-    Args:
-        config_dir: Path to the configuration directory for log file.
-        verbose: If True, set console handler to DEBUG level.
-    """
-    config_dir.mkdir(parents=True, exist_ok=True)
-    log_file = config_dir / "prompter.log"
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-
-    formatter = logging.Formatter("%(asctime)s - %(message)s")
-
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
-
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
+    return merged

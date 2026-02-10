@@ -1,209 +1,198 @@
-"""End-to-end tests for Prompter CLI application."""
+"""End-to-end tests for Prompter.
+
+These tests require the real Claude CLI to be installed and available.
+Run with: pytest tests/test_e2e.py -v -m e2e
+
+Test cases:
+- TC-04: Full development cycle with .adoc format
+- TC-19: Full development cycle with .md format
+"""
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
-from typer.testing import CliRunner
-
-from prompter.main import app
 
 
-runner = CliRunner()
+@pytest.mark.e2e
+def test_full_cycle(tmp_path):
+    """TC-04: Full development cycle using real Claude CLI with .adoc format.
 
+    Requirements:
+    - ORC-01: Full orchestration from prompts to execution
+    - End-to-end verification with real Claude CLI
+    - Uses specs/test_prompts.adoc (tstutil utility prompts)
 
-class TestE2E:
-    """End-to-end test suite for Prompter CLI."""
+    Test approach:
+    - Skip if claude CLI is not available
+    - Run prompter with specs/test_prompts.adoc
+    - Verify src/tstutil/cli.py is created
+    - Verify report.json contains successful results
+    - Verify no permission denials in logs
+    """
+    # Check if claude CLI is available
+    if shutil.which("claude") is None:
+        pytest.skip("claude CLI not found in PATH")
 
-    def test_full_execution(self, tmp_path: Path) -> None:
-        """Test full execution flow with mocked ClaudeRunner."""
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("Prompt 1\n---\nPrompt 2", encoding="utf-8")
+    # Verify test_prompts.adoc exists
+    test_prompts = Path("specs/test_prompts.adoc")
+    if not test_prompts.exists():
+        pytest.skip(f"{test_prompts} not found")
 
-        output_file = tmp_path / "report.json"
+    # Setup output paths
+    output_report = tmp_path / "report.json"
+    log_file = tmp_path / "prompter.log"
 
-        mock_response = {"content": "test", "session_id": "123"}
+    # Expected output file from tstutil prompts
+    expected_output = Path("src/tstutil/cli.py")
 
-        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
-            mock_runner = MagicMock()
-            mock_runner.run_prompt.return_value = mock_response
-            mock_runner_class.return_value = mock_runner
+    # Clean up any existing output from previous runs
+    if expected_output.exists():
+        expected_output.unlink()
+    if expected_output.parent.exists():
+        import shutil as sh
+        sh.rmtree(expected_output.parent)
 
-            with patch("prompter.main.setup_logging"):
-                result = runner.invoke(
-                    app,
-                    [str(prompts_file), "--output", str(output_file)],
-                )
+    # Run prompter with real claude CLI
+    result = subprocess.run(
+        [
+            "poetry", "run", "python", "-m", "prompter",
+            str(test_prompts),
+            "-o", str(output_report)
+        ],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        timeout=600  # 10 minutes for full E2E test
+    )
 
-        assert result.exit_code == 0, f"Exit code was {result.exit_code}: {result.output}"
-        assert output_file.exists(), "Output file was not created"
+    # Verify exit code
+    assert result.returncode == 0, (
+        f"Prompter exited with code {result.returncode}.\n"
+        f"STDOUT:\n{result.stdout}\n"
+        f"STDERR:\n{result.stderr}"
+    )
 
-        report = json.loads(output_file.read_text(encoding="utf-8"))
-        assert len(report) == 2
-        assert report[0]["status"] == "success"
-        assert report[0]["claude_response"] == mock_response
-        assert report[1]["status"] == "success"
+    # Verify src/tstutil/cli.py was created
+    assert expected_output.exists(), (
+        f"Expected output file {expected_output} not created"
+    )
 
-    def test_version_flag(self) -> None:
-        """Test that --version flag shows version and exits."""
-        result = runner.invoke(app, ["--version"])
+    # Verify report.json exists and is valid
+    assert output_report.exists(), "report.json not created"
 
-        assert result.exit_code == 0
-        assert "version" in result.output.lower()
+    with open(output_report, encoding="utf-8") as f:
+        report_data = json.load(f)
 
-    def test_single_prompt(self, tmp_path: Path) -> None:
-        """Test execution with a single prompt."""
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("Single prompt", encoding="utf-8")
+    # Verify report structure
+    assert isinstance(report_data, list), "Report should be a JSON array"
+    assert len(report_data) > 0, "Report should contain at least one result"
 
-        output_file = tmp_path / "report.json"
+    # Verify all prompts succeeded
+    for i, result_entry in enumerate(report_data):
+        assert "status" in result_entry, f"Result {i} missing 'status' field"
+        assert result_entry["status"] == "success", (
+            f"Result {i} failed with status '{result_entry['status']}': "
+            f"{result_entry.get('error', 'No error message')}"
+        )
+        assert "prompt" in result_entry, f"Result {i} missing 'prompt' field"
+        assert "timestamp" in result_entry, f"Result {i} missing 'timestamp' field"
+        assert "claude_response" in result_entry, f"Result {i} missing 'claude_response' field"
 
-        mock_response = {"result": "Success", "session_id": "abc"}
-
-        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
-            mock_runner = MagicMock()
-            mock_runner.run_prompt.return_value = mock_response
-            mock_runner_class.return_value = mock_runner
-
-            with patch("prompter.main.setup_logging"):
-                result = runner.invoke(
-                    app,
-                    [str(prompts_file), "--output", str(output_file)],
-                )
-
-        assert result.exit_code == 0
-        report = json.loads(output_file.read_text(encoding="utf-8"))
-        assert len(report) == 1
-        assert report[0]["prompt"] == "Single prompt"
-
-    def test_json_prompts(self, tmp_path: Path) -> None:
-        """Test execution with JSON prompts file."""
-        prompts_file = tmp_path / "prompts.json"
-        prompts_file.write_text(
-            json.dumps(["First prompt", "Second prompt"]),
-            encoding="utf-8",
+    # Verify no permission denials in logs (if log file exists in default location)
+    default_log = Path.cwd() / "prompter.log"
+    if default_log.exists():
+        log_content = default_log.read_text()
+        assert "permission_denials" not in log_content.lower(), (
+            "Found permission denials in log file"
         )
 
-        output_file = tmp_path / "report.json"
 
-        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
-            mock_runner = MagicMock()
-            mock_runner.run_prompt.return_value = {"result": "ok"}
-            mock_runner_class.return_value = mock_runner
+@pytest.mark.e2e
+def test_full_cycle_md(tmp_path):
+    """TC-19: Full development cycle using real Claude CLI with .md format.
 
-            with patch("prompter.main.setup_logging"):
-                result = runner.invoke(
-                    app,
-                    [str(prompts_file), "--output", str(output_file)],
-                )
+    Requirements:
+    - ORC-01: Full orchestration from prompts to execution
+    - INP-01: Support for .md format with --- separator
+    - End-to-end verification with real Claude CLI
 
-        assert result.exit_code == 0
-        report = json.loads(output_file.read_text(encoding="utf-8"))
-        assert len(report) == 2
+    Test approach:
+    - Skip if claude CLI is not available
+    - Run prompter with specs/test_prompts.md
+    - Verify src/tstutil/cli.py is created
+    - Verify report.json contains successful results
+    - Verify exit code is 0
+    """
+    # Check if claude CLI is available
+    if shutil.which("claude") is None:
+        pytest.skip("claude CLI not found in PATH")
 
-    def test_verbose_flag(self, tmp_path: Path) -> None:
-        """Test that verbose flag is passed correctly."""
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("Test prompt", encoding="utf-8")
+    # Verify test_prompts.md exists
+    test_prompts = Path("specs/test_prompts.md")
+    if not test_prompts.exists():
+        pytest.skip(f"{test_prompts} not found")
 
-        output_file = tmp_path / "report.json"
+    # Setup output paths
+    output_report = tmp_path / "report-md.json"
 
-        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
-            mock_runner = MagicMock()
-            mock_runner.run_prompt.return_value = {"result": "ok"}
-            mock_runner_class.return_value = mock_runner
+    # Expected output file from tstutil prompts
+    expected_output = Path("src/tstutil/cli.py")
 
-            with patch("prompter.main.setup_logging") as mock_setup_logging:
-                result = runner.invoke(
-                    app,
-                    [str(prompts_file), "--output", str(output_file), "--verbose"],
-                )
+    # Clean up any existing output from previous runs
+    if expected_output.exists():
+        expected_output.unlink()
+    if expected_output.parent.exists():
+        import shutil as sh
+        sh.rmtree(expected_output.parent)
 
-                mock_setup_logging.assert_called_once()
-                call_args = mock_setup_logging.call_args
-                assert call_args[1]["verbose"] is True
+    # Run prompter with real claude CLI
+    result = subprocess.run(
+        [
+            "poetry", "run", "python", "-m", "prompter",
+            str(test_prompts),
+            "-o", str(output_report)
+        ],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        timeout=600  # 10 minutes for full E2E test
+    )
 
-        assert result.exit_code == 0
+    # Verify exit code is 0
+    assert result.returncode == 0, (
+        f"Prompter exited with code {result.returncode}.\n"
+        f"STDOUT:\n{result.stdout}\n"
+        f"STDERR:\n{result.stderr}"
+    )
 
-    def test_timeout_option(self, tmp_path: Path) -> None:
-        """Test that timeout option is passed to runner."""
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("Test prompt", encoding="utf-8")
+    # Verify src/tstutil/cli.py was created
+    assert expected_output.exists(), (
+        f"Expected output file {expected_output} not created"
+    )
 
-        output_file = tmp_path / "report.json"
+    # Verify report.json exists and is valid
+    assert output_report.exists(), "report.json not created"
 
-        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
-            mock_runner = MagicMock()
-            mock_runner.run_prompt.return_value = {"result": "ok"}
-            mock_runner_class.return_value = mock_runner
+    with open(output_report, encoding="utf-8") as f:
+        report_data = json.load(f)
 
-            with patch("prompter.main.setup_logging"):
-                result = runner.invoke(
-                    app,
-                    [
-                        str(prompts_file),
-                        "--output",
-                        str(output_file),
-                        "--timeout",
-                        "3600",
-                    ],
-                )
+    # Verify report structure
+    assert isinstance(report_data, list), "Report should be a JSON array"
+    assert len(report_data) > 0, "Report should contain at least one result"
 
-                mock_runner.run_prompt.assert_called_once()
-                call_kwargs = mock_runner.run_prompt.call_args[1]
-                assert call_kwargs["timeout"] == 3600
-
-        assert result.exit_code == 0
-
-    def test_error_handling(self, tmp_path: Path) -> None:
-        """Test that errors during prompt execution are handled gracefully."""
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("Prompt 1\n---\nPrompt 2", encoding="utf-8")
-
-        output_file = tmp_path / "report.json"
-
-        with patch("prompter.main.ClaudeRunner") as mock_runner_class:
-            mock_runner = MagicMock()
-            mock_runner.run_prompt.side_effect = [
-                Exception("Something went wrong"),
-                {"result": "ok"},
-            ]
-            mock_runner_class.return_value = mock_runner
-
-            with patch("prompter.main.setup_logging"):
-                result = runner.invoke(
-                    app,
-                    [str(prompts_file), "--output", str(output_file)],
-                )
-
-        assert result.exit_code == 0
-        report = json.loads(output_file.read_text(encoding="utf-8"))
-        assert len(report) == 2
-        assert report[0]["status"] == "error"
-        assert "Something went wrong" in report[0]["error"]
-        assert report[1]["status"] == "success"
-
-    def test_empty_prompts_file(self, tmp_path: Path) -> None:
-        """Test handling of empty prompts file."""
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("", encoding="utf-8")
-
-        output_file = tmp_path / "report.json"
-
-        with patch("prompter.main.setup_logging"):
-            result = runner.invoke(
-                app,
-                [str(prompts_file), "--output", str(output_file)],
-            )
-
-        assert result.exit_code == 0
-
-    def test_nonexistent_input_file(self, tmp_path: Path) -> None:
-        """Test handling of non-existent input file."""
-        result = runner.invoke(
-            app,
-            [str(tmp_path / "nonexistent.txt")],
+    # Verify all prompts succeeded
+    for i, result_entry in enumerate(report_data):
+        assert "status" in result_entry, f"Result {i} missing 'status' field"
+        assert result_entry["status"] == "success", (
+            f"Result {i} failed with status '{result_entry['status']}': "
+            f"{result_entry.get('error', 'No error message')}"
         )
 
-        assert result.exit_code != 0
+    # Verify report has expected number of results
+    # (both test_prompts.adoc and test_prompts.md should have same prompts)
+    assert len(report_data) >= 3, (
+        f"Expected at least 3 prompts in report, got {len(report_data)}"
+    )

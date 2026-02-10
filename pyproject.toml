@@ -1,6 +1,6 @@
 [project]
 name = "prompter"
-version = "0.1.6"
+version = "0.1.9"
 description = "Batch prompt runner for Claude CLI"
 authors = [
     {name = "Alex Nourov",email = "nourov@specialist-it.com.ua"}

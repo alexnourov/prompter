@@ -1,234 +1,247 @@
-"""Claude Runner module for executing prompts via Claude Code CLI."""
+"""Prompt execution via Claude CLI.
+
+This module handles execution of prompts through the claude CLI tool,
+processing NDJSON output streams and managing timeouts.
+"""
 
 import json
 import logging
 import platform
-import shlex
+import shutil
 import subprocess
 import threading
-from typing import Any
+import time
+from subprocess import DEVNULL, PIPE
+
+from .models import SigtermReceived
 
 logger = logging.getLogger(__name__)
 
 
-class ClaudeRunner:
-    """Runner class for executing prompts via Claude Code CLI.
+def run_prompt(
+    prompt: str,
+    session_id: str | None = None,
+    timeout: int = 2400,
+) -> tuple[dict | None, str | None]:
+    """Execute a prompt using Claude CLI.
 
-    This class manages the interaction with the `claude` CLI tool,
-    handling session persistence, real-time output streaming, and
-    result parsing.
+    Args:
+        prompt: The prompt text to send to Claude
+        session_id: Optional session ID to resume conversation (EXE-07)
+        timeout: Timeout in seconds (default: 2400s = 40min) (ERR-01)
 
-    Attributes:
-        session_id: The current session ID for conversation continuity.
+    Returns:
+        Tuple of (result_object, session_id) where:
+        - result_object: The parsed 'result' event from Claude, or None
+        - session_id: Session ID from 'system' event, or None if not received
+
+    Raises:
+        subprocess.TimeoutExpired: If execution exceeds timeout (process killed)
+        KeyboardInterrupt: If SIGINT received (process killed, re-raised)
+        SigtermReceived: If SIGTERM received (process killed, re-raised)
+        Exception: On non-zero exit code or other errors
     """
+    # Build command (EXE-01, EXE-02..07, EXE-09)
+    cmd = _build_command(prompt, session_id)
 
-    def __init__(self) -> None:
-        """Initialize ClaudeRunner with empty session state."""
-        self.session_id: str | None = None
+    # Start process with stdout/stderr pipes (EXE-01)
+    process = subprocess.Popen(
+        cmd,
+        stdout=PIPE,
+        stderr=PIPE,
+        stdin=DEVNULL,
+        text=True,
+        bufsize=1,  # Line-buffered
+    )
 
-    def run_prompt(
-        self,
-        prompt_text: str,
-        timeout: int = 2400,
-        verbose: bool = False,
-    ) -> dict[str, Any]:
-        """Execute a prompt via Claude Code CLI and return the result.
+    # Start background thread for stderr logging
+    def log_stderr() -> None:
+        """Read stderr and log as WARNING."""
+        if process.stderr:
+            for line in process.stderr:
+                line = line.strip()
+                if line:
+                    logger.warning(f"claude stderr: {line}")
 
-        Args:
-            prompt_text: The prompt text to send to Claude.
-            timeout: Maximum time in seconds to wait for completion.
-            verbose: If True, enable additional debug logging.
+    stderr_thread = threading.Thread(target=log_stderr, daemon=True)
+    stderr_thread.start()
 
-        Returns:
-            A dictionary containing the result from Claude, typically
-            including the response content and metadata.
+    # Calculate absolute deadline (ERR-01)
+    deadline = time.monotonic() + timeout
 
-        Raises:
-            subprocess.TimeoutExpired: If the process exceeds the timeout.
-            KeyboardInterrupt: If the user interrupts execution.
-        """
-        if self.session_id:
-            logger.info("Starting prompt with session_id: %s", self.session_id)
-        else:
-            logger.info("Starting new session")
+    try:
+        # Process NDJSON stream (EXE-08, EXE-10)
+        result_obj, session_id_out = _process_stream(process, deadline, timeout)
 
-        command = self._build_command(prompt_text)
-        logger.debug("Executing command: %s", " ".join(command))
+        # Wait for process completion with remaining timeout
+        remaining = max(deadline - time.monotonic(), 0)
+        process.wait(timeout=remaining)
 
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-        )
+        # Check exit code (ERR-06)
+        if process.returncode != 0:
+            raise Exception(
+                f"Claude CLI exited with non-zero code {process.returncode}. "
+                f"Command: {' '.join(cmd)}"
+            )
 
-        result_holder: dict[str, Any] = {"result": None, "last_json": None}
-        lock = threading.Lock()
+        return (result_obj, session_id_out)
 
-        stdout_thread = threading.Thread(
-            target=self._read_stdout,
-            args=(process.stdout, result_holder, lock, verbose),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=self._read_stderr,
-            args=(process.stderr,),
-            daemon=True,
-        )
+    except subprocess.TimeoutExpired:
+        # Kill process and re-raise (ERR-01)
+        process.kill()
+        raise
 
-        stdout_thread.start()
-        stderr_thread.start()
+    except KeyboardInterrupt:
+        # Kill process and re-raise (INT-02)
+        process.kill()
+        raise
+
+    except SigtermReceived:
+        # Kill process and re-raise (INT-04)
+        process.kill()
+        raise
+
+
+def _build_command(prompt: str, session_id: str | None) -> list[str]:
+    """Build command line arguments for claude CLI.
+
+    Args:
+        prompt: The prompt text
+        session_id: Optional session ID to resume
+
+    Returns:
+        List of command arguments
+    """
+    cmd: list[str] = []
+
+    # Platform-specific stdbuf prefix (EXE-09)
+    system = platform.system()
+    if system in ("Linux", "Darwin"):
+        stdbuf_path = shutil.which("stdbuf")
+        if stdbuf_path:
+            cmd.extend(["stdbuf", "-oL", "-eL"])
+        elif system == "Linux":
+            # On Linux, warn if stdbuf is missing
+            logger.warning(
+                "stdbuf not found on Linux. Install coreutils for optimal buffering. "
+                "Proceeding without stdbuf."
+            )
+        # On macOS (Darwin), stdbuf is optional - no warning needed
+
+    # Base command
+    cmd.append("claude")
+
+    # Prompt with -p flag (EXE-02)
+    cmd.extend(["-p", prompt])
+
+    # Output format (EXE-03)
+    cmd.extend(["--output-format", "stream-json"])
+
+    # Verbose mode (EXE-04)
+    cmd.append("--verbose")
+
+    # Skip permissions (EXE-05)
+    cmd.append("--dangerously-skip-permissions")
+
+    # Resume session if provided (EXE-07)
+    if session_id is not None:
+        cmd.extend(["--resume", session_id])
+
+    return cmd
+
+
+def _process_stream(
+    process: subprocess.Popen,
+    deadline: float,
+    timeout: int,
+) -> tuple[dict | None, str | None]:
+    """Process NDJSON stream from Claude CLI stdout.
+
+    Args:
+        process: The subprocess instance
+        deadline: Absolute deadline (monotonic time) for timeout check
+        timeout: Original timeout value (for TimeoutExpired exception)
+
+    Returns:
+        Tuple of (result_object, session_id)
+
+    Raises:
+        subprocess.TimeoutExpired: If deadline exceeded (ERR-01)
+    """
+    session_id: str | None = None
+    result_obj: dict | None = None
+
+    assert process.stdout is not None
+
+    for line in process.stdout:
+        # Check deadline before processing (ERR-01)
+        if time.monotonic() > deadline:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+
+        line = line.strip()
+        if not line:
+            continue
 
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            logger.error("Process timed out after %d seconds", timeout)
-            process.kill()
-            stdout_thread.join(timeout=1)
-            stderr_thread.join(timeout=1)
-            raise
-        except KeyboardInterrupt:
-            logger.warning("Received keyboard interrupt, terminating process")
-            process.kill()
-            stdout_thread.join(timeout=1)
-            stderr_thread.join(timeout=1)
-            raise
+            event = json.loads(line)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JSON line: {e}. Line: {line[:100]}")
+            continue
 
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
+        event_type = event.get("type")
 
-        with lock:
-            if result_holder["result"] is not None:
-                return result_holder["result"]
-            if result_holder["last_json"] is not None:
-                return result_holder["last_json"]
+        match event_type:
+            case "system":
+                # Extract session_id (EXE-06)
+                session_id = event.get("session_id")
+                logger.debug(f"system: {event}")
 
-        logger.warning("No valid result received from Claude")
-        return {}
+            case "assistant":
+                # Extract and log assistant message (EXE-10)
+                # CLI >= 2.1: message.content; fallback: content
+                message = event.get("message", event)
+                text = _extract_text(message.get("content", []))
+                if text:  # EXE-12: only log non-empty
+                    logger.info(text)
 
-    def _build_command(self, prompt_text: str) -> list[str]:
-        """Build the command list for subprocess execution.
+            case "progress":
+                # Log progress updates (EXE-10)
+                content = event.get("content", "")
+                if content:  # EXE-12: only log non-empty
+                    logger.info(content)
 
-        Args:
-            prompt_text: The prompt text to include in the command.
+            case "result":
+                # Store result and log summary (EXE-10)
+                result_obj = event
+                subtype = event.get("subtype", "unknown")
+                duration_ms = event.get("duration_ms", 0)
+                cost_usd = event.get("total_cost_usd", 0.0)
+                logger.info(f"result: {subtype}, {duration_ms}ms, ${cost_usd:.4f}")
+                logger.debug(f"result_raw: {event}")
 
-        Returns:
-            A list of command arguments ready for Popen.
-        """
-        command: list[str] = []
+    return (result_obj, session_id)
 
-        if platform.system() == "Linux":
-            command.extend(["stdbuf", "-oL", "-eL"])
 
-        command.extend([
-            "claude",
-            "-p",
-            prompt_text,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--dangerously-skip-permissions",
-        ])
+def _extract_text(content: list | str) -> str:
+    """Extract text from Claude message content.
 
-        if self.session_id:
-            command.extend(["--resume", self.session_id])
+    Args:
+        content: Content field from message (array of content blocks or string)
 
-        return command
+    Returns:
+        Concatenated text from all text blocks
+    """
+    if isinstance(content, str):
+        return content
 
-    def _read_stdout(
-        self,
-        stream: Any,
-        result_holder: dict[str, Any],
-        lock: threading.Lock,
-        verbose: bool,
-    ) -> None:
-        """Read and process stdout stream from Claude CLI.
+    if not isinstance(content, list):
+        return ""
 
-        Parses NDJSON output, extracts session info, logs responses,
-        and captures the final result.
+    texts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text", "")
+            if text:
+                texts.append(text)
 
-        Args:
-            stream: The stdout stream from the subprocess.
-            result_holder: Shared dict to store result and last JSON.
-            lock: Threading lock for safe access to result_holder.
-            verbose: If True, log additional debug information.
-        """
-        if stream is None:
-            return
-
-        for line in stream:
-            line = line.rstrip("\n\r")
-            if not line:
-                continue
-
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                logger.debug("Raw output: %s", line)
-                continue
-
-            with lock:
-                result_holder["last_json"] = data
-
-            event_type = data.get("type")
-
-            if event_type == "system":
-                self._handle_system_event(data)
-            elif event_type == "assistant":
-                self._handle_assistant_event(data, verbose)
-            elif event_type == "result":
-                with lock:
-                    result_holder["result"] = data
-                logger.debug("Received result event")
-            else:
-                logger.debug("Event type '%s': %s", event_type, data)
-
-    def _read_stderr(self, stream: Any) -> None:
-        """Read and log stderr stream from Claude CLI.
-
-        Args:
-            stream: The stderr stream from the subprocess.
-        """
-        if stream is None:
-            return
-
-        for line in stream:
-            line = line.rstrip("\n\r")
-            if line:
-                logger.warning("stderr: %s", line)
-
-    def _handle_system_event(self, data: dict[str, Any]) -> None:
-        """Handle system events, extracting session ID.
-
-        Args:
-            data: The parsed system event data.
-        """
-        session_id = data.get("session_id")
-        if session_id and not self.session_id:
-            self.session_id = session_id
-            logger.info("Session ID acquired: %s", session_id)
-
-    def _handle_assistant_event(self, data: dict[str, Any], verbose: bool) -> None:
-        """Handle assistant events, logging response content.
-
-        Args:
-            data: The parsed assistant event data.
-            verbose: If True, log full event data at debug level.
-        """
-        content = data.get("content")
-        if content is None:
-            message = data.get("message", {})
-            content = message.get("content")
-
-        if content:
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        logger.info("Assistant: %s", block.get("text", ""))
-            elif isinstance(content, str):
-                logger.info("Assistant: %s", content)
-
-        if verbose:
-            logger.debug("Assistant event: %s", data)
+    return "\n".join(texts)
