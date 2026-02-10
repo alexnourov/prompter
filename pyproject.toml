@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-prompter = "prompter.main:app"
+prompter = "prompter.cli:app"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
