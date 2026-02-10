@@ -54,6 +54,10 @@ class TestFallbackConfiguration:
         expected_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
         assert formatter._fmt == expected_format
 
+        # Check date format (LOG-05, REP-04: no microseconds)
+        expected_datefmt = "%Y-%m-%d %H:%M:%S"
+        assert formatter.datefmt == expected_datefmt, "Date format should be without microseconds"
+
     def test_fallback_console_handler_format(self, tmp_path: Path) -> None:
         """Test StreamHandler format in fallback mode (LOG-05)."""
         config_dir = tmp_path / "config"
@@ -76,6 +80,10 @@ class TestFallbackConfiguration:
         assert formatter is not None
         expected_format = "%(asctime)s - %(message)s"
         assert formatter._fmt == expected_format
+
+        # Check date format (LOG-05, REP-04: no microseconds)
+        expected_datefmt = "%Y-%m-%d %H:%M:%S"
+        assert formatter.datefmt == expected_datefmt, "Date format should be without microseconds"
 
     def test_fallback_log_file_path(self, tmp_path: Path) -> None:
         """Test log file path in fallback mode (LOG-07)."""

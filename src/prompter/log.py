@@ -68,11 +68,14 @@ def _setup_default_logging(config_dir: Path | None, verbose: bool) -> None:
         log_file = Path.cwd() / "prompter.log"
 
     # Create formatters (LOG-05)
+    # Use datefmt to match REP-04: no microseconds (YYYY-MM-DD HH:MM:SS)
     file_formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
     console_formatter = logging.Formatter(
-        "%(asctime)s - %(message)s"
+        "%(asctime)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
 
     # File handler: always DEBUG (LOG-06)
