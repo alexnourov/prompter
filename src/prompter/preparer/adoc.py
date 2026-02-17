@@ -1,137 +1,143 @@
-"""AsciiDoc format handler (.adoc).
+"""Handler for .adoc (AsciiDoc) prompt files."""
 
-Handles AsciiDoc files with metadata stripping and markup cleaning.
-Two-stage pipeline: separator-based splitting + markup removal.
-"""
+from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
-from . import register_format
+from ..models import Prompt
+from . import _first_sentence, register_format
 
-# Thematic break separator (INP-01a)
-SEPARATOR = "'''"
+# Thematic break: ''' on its own line, surrounded by blank lines (or start/end of text)
+_THEMATIC_BREAK_RE = re.compile(r"(?m)^\s*\n\s*'''\s*\n\s*")
 
-# Include directive pattern (INC-04)
-INCLUDE_PATTERN = re.compile(r'^include::(.+?)\[.*?\]\s*$')
+# AsciiDoc heading: =, ==, ===, etc.
+_HEADING_RE = re.compile(r"^(=+)\s+(.+)$", re.MULTILINE)
+
+# Anchor: [[...]]
+_ANCHOR_RE = re.compile(r"^\[\[.+?\]\]\s*$", re.MULTILINE)
+
+# Include directive: include::path[attrs]
+_INCLUDE_RE = re.compile(r"^include::(.+?)\[.*?\]\s*$", re.MULTILINE)
+
+# Lines to strip during markup cleanup
+_ADMONITION_BLOCK_RE = re.compile(r"^====\s*$")
+_ADMONITION_LABEL_RE = re.compile(r"^\[(NOTE|TIP|WARNING|IMPORTANT|CAUTION)\]\s*$")
+_SOURCE_BLOCK_RE = re.compile(r"^\[source.*?\]\s*$")
+_CODE_FENCE_RE = re.compile(r"^----\s*$")
+_COMMENT_RE = re.compile(r"^//\s")
 
 
 @register_format(".adoc")
-def parse_adoc(content: str, file_path: Path) -> list[str]:
-    """Parse AsciiDoc format prompts.
+def handle_adoc(
+    content: str,
+    file_path: Path,
+    resolve_include: Callable[[Path], list[Prompt]],
+) -> list[Prompt]:
+    """Parse .adoc files: split by thematic breaks, clean markup, resolve includes."""
+    blocks = _THEMATIC_BREAK_RE.split(content)
 
-    Two-stage processing:
-    1. Split by ''' separator, skip first block (metadata) (PRE-02)
-    2. Clean AsciiDoc markup from each prompt (PRE-03)
-    3. Convert include:: directives to @include: markers (INC-04)
+    # If thematic breaks found, skip the first block (metadata, PRE-02)
+    if len(blocks) > 1:
+        blocks = blocks[1:]
 
-    Args:
-        content: File content as string
-        file_path: Path to the file (for error messages)
+    prompts: list[Prompt] = []
 
-    Returns:
-        List of cleaned prompt strings
-    """
-    # Stage 1: Split by thematic breaks (PRE-02)
-    parts = content.split(f"\n{SEPARATOR}\n")
+    for block in blocks:
+        stripped = block.strip()
+        if not stripped:
+            continue
 
-    # If no separators, entire file is one prompt
-    if len(parts) == 1:
-        prompts = [content]
-    else:
-        # Skip first block (metadata)
-        prompts = parts[1:]
+        # PRE-05: Extract title BEFORE markup cleanup
+        title, body_without_heading = _extract_heading(stripped)
 
-    # Stage 2: Clean markup and handle includes (PRE-03, INC-04)
-    cleaned_prompts: list[str] = []
+        # PRE-03: Clean markup from body
+        cleaned = _clean_markup(body_without_heading if title else stripped)
 
-    for prompt in prompts:
-        cleaned = _clean_markup(prompt.strip())
-
-        # Check if cleaned prompt is an include directive
-        include_match = INCLUDE_PATTERN.match(cleaned.strip())
+        # INC-04: Check if the cleaned body is solely an include directive
+        include_match = _INCLUDE_RE.fullmatch(cleaned.strip())
         if include_match:
-            include_path = include_match.group(1).strip()
-            cleaned_prompts.append(f"@include: {include_path}")
-        else:
-            if cleaned:  # Skip empty prompts
-                cleaned_prompts.append(cleaned)
+            inc_path = include_match.group(1)
+            prompts.extend(resolve_include(Path(inc_path)))
+            continue
 
-    return cleaned_prompts
+        if not cleaned.strip():
+            continue
+
+        if not title:
+            title = _first_sentence(cleaned)
+
+        prompts.append(Prompt(title=title, body=cleaned.strip()))
+
+    return prompts
+
+
+def _extract_heading(text: str) -> tuple[str | None, str]:
+    """Extract AsciiDoc heading, skipping anchors and blank lines.
+
+    Returns (title, body_without_heading_line) or (None, original_text).
+    """
+    lines = text.split("\n")
+    heading_idx = None
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _ANCHOR_RE.match(stripped):
+            continue
+        # First non-blank, non-anchor line — check if it's a heading
+        heading_match = _HEADING_RE.match(stripped)
+        if heading_match:
+            heading_idx = i
+        break
+
+    if heading_idx is not None:
+        title = _HEADING_RE.match(lines[heading_idx].strip()).group(2).strip()
+        remaining_lines = lines[:heading_idx] + lines[heading_idx + 1:]
+        return title, "\n".join(remaining_lines)
+
+    return None, text
 
 
 def _clean_markup(text: str) -> str:
-    """Remove AsciiDoc markup while preserving content.
+    """Remove AsciiDoc structural markup while preserving content (PRE-03).
 
-    Removes:
-    - Anchors [[...]]
-    - Section headers (==, ===, etc.)
-    - Source block markers [source,...] and delimiters (----)
-    - Admonitions ([NOTE], ====)
-    - Comments (// ...)
-
-    Preserves:
-    - Text content
-    - Code block content
-    - Lists
-    - Bold/italic (*text*, _text_)
-    - Inline code (`code`)
-
-    Args:
-        text: Raw AsciiDoc text
-
-    Returns:
-        Cleaned text with markup removed
+    Removes: anchors, headings, [source,...], ----, [NOTE]/====, // comments.
+    Preserves: text, code block contents, lists, bold/italic, inline code.
     """
-    lines = text.splitlines()
-    result_lines: list[str] = []
+    lines = text.split("\n")
+    result: list[str] = []
     in_code_block = False
-    in_admonition = False
 
     for line in lines:
         stripped = line.strip()
 
-        # Toggle code block state
-        if stripped == "----":
+        # Toggle code block state on ----
+        if _CODE_FENCE_RE.match(stripped):
             in_code_block = not in_code_block
-            continue  # Skip delimiter line
-
-        # Toggle admonition block state
-        if stripped == "====":
-            in_admonition = not in_admonition
             continue
 
-        # Inside code block or admonition: preserve content as-is
-        if in_code_block or in_admonition:
-            result_lines.append(line)
+        # Inside code blocks — preserve everything
+        if in_code_block:
+            result.append(line)
             continue
 
-        # Remove anchors [[...]]
-        line = re.sub(r'\[\[.*?\]\]', '', line)
-
-        # Remove section headers (== Title, === Subtitle, etc.)
-        if re.match(r'^=+\s+', stripped):
+        # Outside code blocks — remove structural markup
+        if _ANCHOR_RE.match(stripped):
+            continue
+        if _HEADING_RE.match(stripped):
+            continue
+        if _SOURCE_BLOCK_RE.match(stripped):
+            continue
+        if _ADMONITION_BLOCK_RE.match(stripped):
+            continue
+        if _ADMONITION_LABEL_RE.match(stripped):
+            continue
+        if _COMMENT_RE.match(stripped):
             continue
 
-        # Remove source block attributes [source,...]
-        if re.match(r'^\[source,.*?\]$', stripped):
-            continue
+        result.append(line)
 
-        # Remove admonition markers [NOTE], [WARNING], etc.
-        if re.match(r'^\[(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]$', stripped):
-            continue
-
-        # Remove comments (// ...)
-        if stripped.startswith('//'):
-            continue
-
-        # Keep all other lines
-        if line.strip():  # Skip completely empty lines
-            result_lines.append(line)
-
-    # Join and clean up excessive whitespace
-    result = '\n'.join(result_lines)
-    # Collapse multiple blank lines into single blank line
-    result = re.sub(r'\n\s*\n\s*\n+', '\n\n', result)
-
-    return result.strip()
+    return "\n".join(result)

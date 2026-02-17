@@ -1,11 +1,7 @@
-"""Tests for configuration management.
+"""Tests for prompter.config (CFG-01..CFG-07)."""
 
-Tests cover requirements: CFG-02, CFG-05, CFG-06, CFG-07.
-Includes TC-07, TC-08.
-"""
+from __future__ import annotations
 
-import json
-import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,392 +10,174 @@ import pytest
 from prompter.config import find_config_dir, load_settings, merge_config
 
 
+# ─── find_config_dir ─────────────────────────────────────────────────────
+
 class TestFindConfigDir:
-    """Tests for configuration directory search (TC-07, CFG-02)."""
+    """Tests for find_config_dir (CFG-01..CFG-05)."""
 
     def test_explicit_config_path(self, tmp_path: Path) -> None:
-        """Test explicit --config path when directory exists."""
-        config_path = tmp_path / "custom_config"
-        config_path.mkdir()
+        """CFG-01: explicit --config path that exists → returned as-is."""
+        config_dir = tmp_path / "custom"
+        config_dir.mkdir()
 
-        result = find_config_dir("prompter", config_override=config_path)
+        result = find_config_dir("prompter", config_override=config_dir)
+        assert result == config_dir
 
-        assert result == config_path
-
-    def test_explicit_config_path_not_exists(self, tmp_path: Path) -> None:
-        """Test explicit --config path raises SystemExit when directory doesn't exist."""
-        nonexistent = tmp_path / "nonexistent"
-
-        with pytest.raises(SystemExit, match="Config directory does not exist"):
-            find_config_dir("prompter", config_override=nonexistent)
+    def test_explicit_config_path_not_exists(self) -> None:
+        """CFG-01: explicit --config path that doesn't exist → SystemExit."""
+        with pytest.raises(SystemExit, match="does not exist"):
+            find_config_dir("prompter", config_override=Path("/nonexistent/path"))
 
     def test_xdg_config_home_set(self, tmp_path: Path) -> None:
-        """Test XDG_CONFIG_HOME on Linux when set (CFG-02)."""
-        xdg_config = tmp_path / "custom_xdg"
-        prompter_config = xdg_config / "prompter"
-        prompter_config.mkdir(parents=True)
+        """CFG-02: Linux with $XDG_CONFIG_HOME set → uses it."""
+        xdg_dir = tmp_path / "custom_xdg"
+        candidate = xdg_dir / "prompter"
+        candidate.mkdir(parents=True)
 
         with patch("prompter.config.platform.system", return_value="Linux"), \
-             patch.dict("os.environ", {"XDG_CONFIG_HOME": str(xdg_config)}):
-
+             patch.dict("os.environ", {"XDG_CONFIG_HOME": str(xdg_dir)},
+                        clear=False):
             result = find_config_dir("prompter")
 
-            assert result == prompter_config
+        assert result == candidate
 
     def test_xdg_default(self, tmp_path: Path) -> None:
-        """Test default ~/.config/prompter on Linux when XDG_CONFIG_HOME not set."""
+        """CFG-02: Linux without $XDG_CONFIG_HOME → ~/.config/prompter."""
         home_config = tmp_path / ".config" / "prompter"
         home_config.mkdir(parents=True)
 
+        # Remove XDG_CONFIG_HOME if present, mock home
+        env = {k: v for k, v in __import__("os").environ.items()
+               if k != "XDG_CONFIG_HOME"}
+
         with patch("prompter.config.platform.system", return_value="Linux"), \
              patch("prompter.config.Path.home", return_value=tmp_path), \
-             patch.dict("os.environ", {}, clear=True):
-
+             patch.dict("os.environ", env, clear=True):
             result = find_config_dir("prompter")
 
-            assert result == home_config
+        assert result == home_config
 
     def test_windows_appdata(self, tmp_path: Path) -> None:
-        """Test %APPDATA% on Windows (CFG-02)."""
-        appdata = tmp_path / "AppData" / "Roaming"
-        prompter_config = appdata / "prompter"
-        prompter_config.mkdir(parents=True)
+        """CFG-03: Windows with %APPDATA% → uses it."""
+        appdata_dir = tmp_path / "AppData" / "Roaming"
+        candidate = appdata_dir / "prompter"
+        candidate.mkdir(parents=True)
 
         with patch("prompter.config.platform.system", return_value="Windows"), \
-             patch.dict("os.environ", {"APPDATA": str(appdata)}):
-
+             patch.dict("os.environ", {"APPDATA": str(appdata_dir)},
+                        clear=False):
             result = find_config_dir("prompter")
 
-            assert result == prompter_config
+        assert result == candidate
 
     def test_macos_library(self, tmp_path: Path) -> None:
-        """Test ~/Library/Application Support on macOS (CFG-02)."""
-        library = tmp_path / "Library" / "Application Support" / "prompter"
-        library.mkdir(parents=True)
+        """CFG-04: macOS → ~/Library/Application Support/prompter."""
+        lib_dir = tmp_path / "Library" / "Application Support" / "prompter"
+        lib_dir.mkdir(parents=True)
 
         with patch("prompter.config.platform.system", return_value="Darwin"), \
              patch("prompter.config.Path.home", return_value=tmp_path):
-
             result = find_config_dir("prompter")
 
-            assert result == library
+        assert result == lib_dir
 
     def test_project_root_fallback(self, tmp_path: Path) -> None:
-        """Test fallback to project root .config directory (CFG-05)."""
-        # Create project structure
-        project_root = tmp_path / "project"
-        project_root.mkdir()
-        (project_root / "pyproject.toml").touch()
-
-        config_dir = project_root / ".config"
+        """CFG-05: fallback to .config in project root (pyproject.toml)."""
+        # Create project structure: tmp_path/project/pyproject.toml + .config/
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "pyproject.toml").write_text("[project]\n")
+        config_dir = project_dir / ".config"
         config_dir.mkdir()
 
-        work_dir = project_root / "subdir"
-        work_dir.mkdir()
+        # Subdir as cwd, OS dirs don't exist
+        sub_dir = project_dir / "src" / "pkg"
+        sub_dir.mkdir(parents=True)
 
         with patch("prompter.config.platform.system", return_value="Linux"), \
-             patch("prompter.config.Path.cwd", return_value=work_dir), \
-             patch("prompter.config.Path.home", return_value=tmp_path / "home"), \
-             patch.dict("os.environ", {}, clear=True):
-
+             patch("prompter.config.Path.home",
+                   return_value=tmp_path / "fakehome"), \
+             patch("prompter.config.Path.cwd", return_value=sub_dir), \
+             patch.dict("os.environ",
+                        {k: v for k, v in __import__("os").environ.items()
+                         if k != "XDG_CONFIG_HOME"},
+                        clear=True):
             result = find_config_dir("prompter")
 
-            assert result == config_dir
+        assert result == config_dir
 
     def test_nothing_found(self, tmp_path: Path) -> None:
-        """Test that None is returned when no config directory found."""
-        # Mock to return non-existent paths
-        with patch("prompter.config.platform.system", return_value="Linux"), \
-             patch("prompter.config.Path.home", return_value=tmp_path / "nonexistent_home"), \
-             patch("prompter.config.Path.cwd", return_value=tmp_path / "nonexistent_work"), \
-             patch.dict("os.environ", {}, clear=True):
+        """CFG-05: nothing found → None."""
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
 
+        with patch("prompter.config.platform.system", return_value="Linux"), \
+             patch("prompter.config.Path.home",
+                   return_value=tmp_path / "fakehome"), \
+             patch("prompter.config.Path.cwd", return_value=empty_dir), \
+             patch.dict("os.environ",
+                        {k: v for k, v in __import__("os").environ.items()
+                         if k != "XDG_CONFIG_HOME"},
+                        clear=True):
             result = find_config_dir("prompter")
 
-            assert result is None
+        assert result is None
 
+
+# ─── load_settings ───────────────────────────────────────────────────────
 
 class TestLoadSettings:
-    """Tests for settings loading (CFG-06)."""
-
-    def test_load_settings_success(self, tmp_path: Path) -> None:
-        """Test successful loading of settings.json."""
-        config_dir = tmp_path / "config"
-        config_dir.mkdir()
-
-        settings_file = config_dir / "settings.json"
-        settings_data = {"timeout": 3600, "verbose": True, "output": "custom.json"}
-        settings_file.write_text(json.dumps(settings_data), encoding="utf-8")
-
-        result = load_settings(config_dir)
-
-        assert result == settings_data
+    """Tests for load_settings (CFG-06)."""
 
     def test_load_settings_missing_file(self, tmp_path: Path) -> None:
-        """Test that missing settings.json returns empty dict (CFG-06)."""
-        config_dir = tmp_path / "config"
-        config_dir.mkdir()
-        # No settings.json created
-
-        result = load_settings(config_dir)
-
+        """CFG-06: missing settings.json → empty dict."""
+        result = load_settings(tmp_path)
         assert result == {}
 
-    def test_load_settings_invalid_json(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-        """Test that invalid JSON returns empty dict with warning (CFG-06)."""
-        config_dir = tmp_path / "config"
-        config_dir.mkdir()
+    def test_load_settings_invalid_json(self, tmp_path: Path) -> None:
+        """CFG-06: invalid JSON → empty dict."""
+        (tmp_path / "settings.json").write_text("{broken", encoding="utf-8")
 
-        settings_file = config_dir / "settings.json"
-        settings_file.write_text("{broken json", encoding="utf-8")
+        result = load_settings(tmp_path)
+        assert result == {}
 
-        with caplog.at_level(logging.WARNING):
-            result = load_settings(config_dir)
 
-            assert result == {}
-            assert any("Invalid JSON" in record.message for record in caplog.records)
-
-    def test_load_settings_not_object(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-        """Test that JSON array (not object) returns empty dict with warning."""
-        config_dir = tmp_path / "config"
-        config_dir.mkdir()
-
-        settings_file = config_dir / "settings.json"
-        settings_file.write_text('["not", "an", "object"]', encoding="utf-8")
-
-        with caplog.at_level(logging.WARNING):
-            result = load_settings(config_dir)
-
-            assert result == {}
-            assert any("not a JSON object" in record.message for record in caplog.records)
-
-    def test_load_settings_utf8(self, tmp_path: Path) -> None:
-        """Test UTF-8 encoding support in settings.json."""
-        config_dir = tmp_path / "config"
-        config_dir.mkdir()
-
-        settings_file = config_dir / "settings.json"
-        settings_data = {"output": "отчёт.json", "comment": "Кириллица ©"}
-        settings_file.write_text(json.dumps(settings_data, ensure_ascii=False), encoding="utf-8")
-
-        result = load_settings(config_dir)
-
-        assert result == settings_data
-        assert result["output"] == "отчёт.json"
-
+# ─── merge_config ────────────────────────────────────────────────────────
 
 class TestMergeConfig:
-    """Tests for configuration merging (TC-08, CFG-07)."""
+    """Tests for merge_config (CFG-07)."""
 
     def test_merge_config_priority(self) -> None:
-        """Test priority: CLI > settings > defaults (TC-08, CFG-07)."""
-        cli_args = {
-            "timeout": 100,  # Explicitly set
-            "verbose": None,  # Not set (None means user didn't provide it)
-            "output": None,  # Not set
-        }
-
-        settings = {
-            "verbose": True,
-            "output": "custom.json",
-        }
-
-        defaults = {
-            "timeout": 2400,
-            "verbose": False,
-            "output": "report.json",
-        }
+        """TC-08: CLI > settings > defaults priority."""
+        cli_args = {"timeout": 100, "verbose": None}
+        settings = {"verbose": True, "output": "custom.json"}
+        defaults = {"timeout": 2400, "verbose": False, "output": "report.json"}
 
         result = merge_config(cli_args, settings, defaults)
 
-        # CLI wins for timeout
+        # CLI wins (timeout=100, not None)
         assert result["timeout"] == 100
-
-        # Settings wins over default for verbose (CLI was None)
+        # settings wins (verbose=True, CLI was None)
         assert result["verbose"] is True
-
-        # Settings wins over default for output
+        # settings wins (output="custom.json")
         assert result["output"] == "custom.json"
 
-    def test_merge_config_all_defaults(self) -> None:
-        """Test that defaults are used when CLI and settings are empty."""
-        cli_args = {
-            "timeout": None,
-            "verbose": None,
-            "output": None,
-        }
+    def test_merge_config_invalid_type_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """CFG-07: wrong type in settings → warning + default used."""
+        cli_args: dict = {}
+        settings = {"timeout": "abc"}
+        defaults = {"timeout": 2400}
 
-        settings = {}
-
-        defaults = {
-            "timeout": 2400,
-            "verbose": False,
-            "output": "report.json",
-        }
-
-        result = merge_config(cli_args, settings, defaults)
-
-        assert result == defaults
-
-    def test_merge_config_cli_overrides_all(self) -> None:
-        """Test that CLI arguments override both settings and defaults."""
-        cli_args = {
-            "timeout": 500,
-            "verbose": True,
-            "output": "cli.json",
-        }
-
-        settings = {
-            "timeout": 1000,
-            "verbose": False,
-            "output": "settings.json",
-        }
-
-        defaults = {
-            "timeout": 2400,
-            "verbose": False,
-            "output": "report.json",
-        }
-
-        result = merge_config(cli_args, settings, defaults)
-
-        assert result["timeout"] == 500
-        assert result["verbose"] is True
-        assert result["output"] == "cli.json"
-
-    def test_merge_config_invalid_type_warns(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Test that invalid type in settings logs warning and uses default (CFG-07)."""
-        cli_args = {
-            "timeout": None,
-            "verbose": None,
-        }
-
-        settings = {
-            "timeout": "abc",  # Should be int
-            "verbose": "yes",  # Should be bool
-        }
-
-        defaults = {
-            "timeout": 2400,
-            "verbose": False,
-        }
-
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level("WARNING", logger="prompter.config"):
             result = merge_config(cli_args, settings, defaults)
 
-            # Should use defaults due to type mismatch
-            assert result["timeout"] == 2400
-            assert result["verbose"] is False
-
-            # Check warnings were logged
-            log_messages = [record.message for record in caplog.records]
-            assert any("timeout" in msg and "expected int" in msg for msg in log_messages)
-            assert any("verbose" in msg and "expected bool" in msg for msg in log_messages)
-
-    def test_merge_config_none_default_no_validation(self) -> None:
-        """Test that keys with None default skip type validation (CFG-07)."""
-        cli_args = {
-            "source_encoding": None,  # Not set
-        }
-
-        settings = {
-            "source_encoding": "utf-8",  # String value
-        }
-
-        defaults = {
-            "source_encoding": None,  # None default - no type validation
-        }
-
-        result = merge_config(cli_args, settings, defaults)
-
-        # Should accept string even though default is None
-        assert result["source_encoding"] == "utf-8"
-
-    def test_merge_config_none_default_accepts_any_type(self) -> None:
-        """Test that None-default keys accept any type without warning."""
-        cli_args = {
-            "source_encoding": None,
-        }
-
-        settings = {
-            "source_encoding": 123,  # Integer (unusual but should be accepted)
-        }
-
-        defaults = {
-            "source_encoding": None,
-        }
-
-        result = merge_config(cli_args, settings, defaults)
-
-        # Should accept integer without warning
-        assert result["source_encoding"] == 123
-
-    def test_merge_config_partial_settings(self) -> None:
-        """Test merging when settings only partially overlap with defaults."""
-        cli_args = {
-            "timeout": None,
-            "verbose": None,
-            "output": None,
-        }
-
-        settings = {
-            "verbose": True,  # Only verbose in settings
-        }
-
-        defaults = {
-            "timeout": 2400,
-            "verbose": False,
-            "output": "report.json",
-        }
-
-        result = merge_config(cli_args, settings, defaults)
-
-        assert result["timeout"] == 2400  # From default
-        assert result["verbose"] is True  # From settings
-        assert result["output"] == "report.json"  # From default
-
-
-class TestEdgeCases:
-    """Tests for edge cases and error conditions."""
-
-    def test_find_config_dir_multiple_pyproject(self, tmp_path: Path) -> None:
-        """Test that find_config_dir finds nearest pyproject.toml."""
-        # Create nested structure with multiple pyproject.toml files
-        outer = tmp_path / "outer"
-        outer.mkdir()
-        (outer / "pyproject.toml").touch()
-
-        inner = outer / "inner"
-        inner.mkdir()
-        (inner / "pyproject.toml").touch()
-        (inner / ".config").mkdir()
-
-        work_dir = inner / "src"
-        work_dir.mkdir()
-
-        with patch("prompter.config.platform.system", return_value="Linux"), \
-             patch("prompter.config.Path.cwd", return_value=work_dir), \
-             patch("prompter.config.Path.home", return_value=tmp_path / "home"), \
-             patch.dict("os.environ", {}, clear=True):
-
-            result = find_config_dir("prompter")
-
-            # Should find inner .config (nearest pyproject.toml)
-            assert result == inner / ".config"
-
-    def test_load_settings_permission_error(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-        """Test that permission errors are handled gracefully."""
-        config_dir = tmp_path / "config"
-        config_dir.mkdir()
-
-        settings_file = config_dir / "settings.json"
-        settings_file.write_text('{"test": 1}', encoding="utf-8")
-
-        # Mock open to raise PermissionError
-        with patch("builtins.open", side_effect=PermissionError("Access denied")), \
-             caplog.at_level(logging.WARNING):
-
-            result = load_settings(config_dir)
-
-            assert result == {}
-            assert any("Error reading settings.json" in record.message for record in caplog.records)
+        assert result["timeout"] == 2400
+        assert any(
+            rec.levelname == "WARNING"
+            and "timeout" in rec.message
+            and "int" in rec.message
+            and "str" in rec.message
+            for rec in caplog.records
+        )

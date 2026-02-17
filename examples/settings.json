@@ -2,5 +2,16 @@
   "verbose": false,
   "timeout": 3600,
   "output": "results.json",
-  "source_encoding": null
+  "source_encoding": null,
+  "assistant": "claude",
+  "gemini": {
+    "model": null
+  },
+  "aider": {
+    "api_key": null,
+    "anthropic_api_key": null,
+    "openai_api_key": null,
+    "DEEPSEEK_API_KEY": null,
+    "model": null
+  }
 }

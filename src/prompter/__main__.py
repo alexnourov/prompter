@@ -1,9 +1,5 @@
-"""Entry point for running prompter as a module.
-
-Allows execution via: python -m prompter
-"""
+"""Entry point for ``python -m prompter`` (CLI-05)."""
 
 from .cli import app
 
-if __name__ == "__main__":
-    app()
+app()

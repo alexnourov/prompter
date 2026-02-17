@@ -1,82 +1,96 @@
-"""Text format handler (.txt, .md).
+"""Handler for .txt and .md prompt files."""
 
-Handles plain text and Markdown files with separator-based splitting.
-Supports escape sequences for literal separators.
-"""
+from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
-from . import register_format
+from ..models import Prompt
+from . import _first_sentence, register_format
 
-# Separator pattern (INP-01, INP-04)
-SEPARATOR = "---"
+_SEPARATOR = "---"
+_INCLUDE_RE = re.compile(r"^@include:\s*(.+)$", re.MULTILINE)
+_HEADING_RE = re.compile(r"^#+\s+(.+)$", re.MULTILINE)
+
+
+def _split_blocks(content: str) -> list[str]:
+    """Split content by '---' separators, handling escape sequences.
+
+    \\--- → literal '---'
+    \\\\--- → literal '\\---'
+    """
+    # Temporarily replace escaped sequences
+    placeholder_double = "\x00DOUBLE_ESCAPE\x00"
+    placeholder_single = "\x00SINGLE_ESCAPE\x00"
+
+    text = content.replace("\\\\---", placeholder_double)
+    text = text.replace("\\---", placeholder_single)
+
+    blocks = re.split(r"^---$", text, flags=re.MULTILINE)
+
+    # Restore escape sequences
+    restored = []
+    for block in blocks:
+        block = block.replace(placeholder_single, "---")
+        block = block.replace(placeholder_double, "\\---")
+        restored.append(block)
+
+    return restored
 
 
 @register_format(".txt", ".md")
-def parse_text(content: str, file_path: Path) -> list[str]:
-    """Parse text/Markdown format prompts.
+def handle_text(
+    content: str,
+    file_path: Path,
+    resolve_include: Callable[[Path], list[Prompt]],
+) -> list[Prompt]:
+    """Parse .txt/.md files: split by '---', resolve @include directives."""
+    blocks = _split_blocks(content)
+    is_md = file_path.suffix.lower() == ".md"
 
-    Format:
-    - Prompts separated by '---' on its own line
-    - First block (before first separator) is metadata and is skipped (PRE-02)
-    - Escape sequences: \\--- → literal ---, \\\\--- → literal \\--- (INC-03)
-    - @include directives pass through unchanged; resolved by parent
+    # If separators found, skip the first block (metadata, PRE-02)
+    if len(blocks) > 1:
+        blocks = blocks[1:]
 
-    Args:
-        content: File content as string
-        file_path: Path to the file (for error messages)
+    prompts: list[Prompt] = []
 
-    Returns:
-        List of prompt strings
-    """
-    lines = content.splitlines()
-    processed_lines: list[str] = []
+    for block in blocks:
+        stripped = block.strip()
+        if not stripped:
+            continue
 
-    # Process escape sequences (INC-03)
-    # First pass: handle separators on separate lines
-    for line in lines:
-        stripped_line = line.strip()
-        if stripped_line == r"\---":
-            # Single backslash escape on its own line: becomes literal ---
-            processed_lines.append("---")
-        elif stripped_line == r"\\---":
-            # Double backslash escape on its own line: becomes literal \---
-            processed_lines.append(r"\---")
-        else:
-            # For other lines, process escape sequences inline
-            # Replace \--- with --- and \\--- with \---
-            processed_line = line.replace(r"\\---", "\x00DOUBLE_ESC\x00")  # Temporary marker
-            processed_line = processed_line.replace(r"\---", "---")
-            processed_line = processed_line.replace("\x00DOUBLE_ESC\x00", r"\---")
-            processed_lines.append(processed_line)
+        # Check for @include directives
+        include_match = _INCLUDE_RE.search(stripped)
+        if include_match:
+            # Process all @include directives in this block
+            remaining = stripped
+            parts = _INCLUDE_RE.split(remaining)
+            # parts: [before, path, after, path, ...]
+            i = 0
+            while i < len(parts):
+                text_part = parts[i].strip()
+                if text_part:
+                    prompts.append(_make_prompt(text_part, is_md))
+                i += 1
+                if i < len(parts):
+                    inc_path = parts[i].strip()
+                    prompts.extend(resolve_include(Path(inc_path)))
+                    i += 1
+            continue
 
-    # Rejoin content
-    processed_content = "\n".join(processed_lines)
+        prompts.append(_make_prompt(stripped, is_md))
 
-    # Split by separator (must be on its own line)
-    # Need to handle both \n---\n and edge cases
-    parts = []
-    current_part = []
-    for i, line in enumerate(processed_lines):
-        if line.strip() == SEPARATOR:
-            # Found separator on its own line
-            parts.append("\n".join(current_part))
-            current_part = []
-        else:
-            current_part.append(line)
-    # Add last part
-    if current_part or parts:  # If we had separators or have remaining content
-        parts.append("\n".join(current_part))
+    return prompts
 
-    # If no separators found, entire file is one prompt
-    if len(parts) == 1:
-        stripped_content = processed_content.strip()
-        # Return empty list if content is empty (INP-05)
-        return [stripped_content] if stripped_content else []
 
-    # First block is metadata, skip it (PRE-02)
-    prompts = [part.strip() for part in parts[1:]]
+def _make_prompt(text: str, is_md: bool) -> Prompt:
+    """Create a Prompt from a text block, extracting title per format rules."""
+    if is_md:
+        heading_match = _HEADING_RE.match(text)
+        if heading_match:
+            title = heading_match.group(1).strip()
+            body = text[heading_match.end():].strip()
+            return Prompt(title=_first_sentence(title), body=body)
 
-    # Filter out empty prompts
-    return [p for p in prompts if p]
+    return Prompt(title=_first_sentence(text), body=text)

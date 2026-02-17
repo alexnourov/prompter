@@ -1,100 +1,61 @@
-"""Logging configuration for Prompter.
+"""Logging configuration (LOG-01..LOG-06, REP-04)."""
 
-This module handles logging setup with support for:
-- Custom configuration via logging.json (LOG-02, LOG-03, LOG-04)
-- Fallback to default configuration (LOG-05)
-- Dual output: file (always DEBUG) + console (INFO or DEBUG based on --verbose) (LOG-06)
-"""
+from __future__ import annotations
 
 import json
 import logging
 import logging.config
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
+_DATE_FMT = "%Y-%m-%d %H:%M:%S"
+_FILE_FMT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+_CONSOLE_FMT = "%(asctime)s - %(message)s"
+
 
 def setup_logging(config_dir: Path | None, verbose: bool) -> None:
-    """Set up logging configuration.
-
-    Configuration priority (LOG-01):
-    1. Custom config from logging.json if present (LOG-02, LOG-03)
-    2. Fallback to default configuration (LOG-05)
+    """Configure logging from JSON config or fallback (LOG-01..LOG-06).
 
     Args:
-        config_dir: Configuration directory (may be None if not found)
-        verbose: Enable verbose console output (--verbose flag)
-
-    Logging behavior (LOG-06):
-    - Root logger: always DEBUG level
-    - File handler: always DEBUG level (full logs to file)
-    - Console handler: DEBUG if verbose=True, INFO otherwise
+        config_dir: Directory containing logging.json, or None.
+        verbose: If True, console handler uses DEBUG; otherwise INFO.
     """
-    # Try to load custom configuration (LOG-02, LOG-03)
+    # 1. Try custom config file (LOG-02, LOG-03)
     if config_dir is not None:
         config_file = config_dir / "logging.json"
-        if config_file.exists():
+        if config_file.is_file():
             try:
-                with open(config_file, encoding="utf-8") as f:
-                    config = json.load(f)
-
-                # Apply custom configuration (LOG-03, LOG-04)
-                logging.config.dictConfig(config)
+                text = config_file.read_text(encoding="utf-8")
+                config = json.loads(text)
+                logging.config.dictConfig(config)  # LOG-03, LOG-04
                 return
+            except Exception as exc:
+                # Fallback on any error — will set up default below
+                logging.getLogger(__name__).warning(
+                    "Failed to load %s: %s. Using fallback.", config_file, exc
+                )
 
-            except (json.JSONDecodeError, ValueError, KeyError) as e:
-                # If custom config fails, fall through to default
-                # Use print here since logging isn't configured yet
-                print(f"Warning: Failed to load logging.json: {e}. Using default configuration.")
+    # 2. Fallback configuration (LOG-05)
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)  # LOG-06: root always DEBUG
 
-    # Fallback to default configuration (LOG-05)
-    _setup_default_logging(config_dir, verbose)
+    # FileHandler — DEBUG level, detailed format
+    log_dir = config_dir if config_dir is not None else Path.cwd()
+    log_file = log_dir / "prompter.log"
 
-
-def _setup_default_logging(config_dir: Path | None, verbose: bool) -> None:
-    """Set up default logging configuration when logging.json is not found.
-
-    Configuration (LOG-05):
-    - File handler: prompter.log with DEBUG level, detailed format
-    - Console handler: INFO/DEBUG level based on verbose flag, simple format
-    - Root logger: DEBUG level (filtering happens at handler level)
-
-    Args:
-        config_dir: Configuration directory for log file location
-        verbose: Enable verbose console output
-    """
-    # Determine log file location
-    if config_dir is not None:
-        log_file = config_dir / "prompter.log"
-    else:
-        log_file = Path.cwd() / "prompter.log"
-
-    # Create formatters (LOG-05)
-    # Use datefmt to match REP-04: no microseconds (YYYY-MM-DD HH:MM:SS)
-    file_formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    console_formatter = logging.Formatter(
-        "%(asctime)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-    # File handler: always DEBUG (LOG-06)
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(file_formatter)
+    file_handler.setLevel(logging.DEBUG)  # LOG-06
+    file_handler.setFormatter(
+        logging.Formatter(_FILE_FMT, datefmt=_DATE_FMT)
+    )
 
-    # Console handler: DEBUG if verbose, otherwise INFO (LOG-06)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
-    console_handler.setFormatter(console_formatter)
+    # StreamHandler — DEBUG/INFO based on verbose
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    stream_handler.setFormatter(
+        logging.Formatter(_CONSOLE_FMT, datefmt=_DATE_FMT)
+    )
 
-    # Configure root logger (LOG-06)
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)  # Always DEBUG at root level
-
-    # Clear any existing handlers (in case setup_logging is called multiple times)
-    root_logger.handlers.clear()
-
-    # Add handlers
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)

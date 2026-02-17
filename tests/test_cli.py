@@ -1,807 +1,686 @@
-"""Tests for CLI application.
+"""Tests for prompter.cli (INT-01..INT-04, TC-12..TC-22, ORC, ERR, LOG-08, REP, DOC-03)."""
 
-Tests cover requirements: INT-01..04, ERR-10, ERR-11, CLI-01..05.
-Includes TC-09 (interruption scenarios).
-"""
+from __future__ import annotations
 
 import json
+import re
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
 
-from prompter.cli import app
-from prompter.models import SigtermReceived
+from prompter.cli import app, execution_loop
+from prompter.models import Prompt, PromptResult, SessionIntegrityError, SigtermReceived
 
-runner = CliRunner()
+runner_cli = CliRunner()
 
 
-class TestInterruption:
-    """Tests for interruption handling (TC-09, INT-01, INT-03)."""
+# ─── Helpers ───────────────────────────────────────────────────────────────
+
+def _make_runner(side_effects: list | None = None) -> MagicMock:
+    """Create a mock AssistantRunner with controlled run_prompt behavior."""
+    mock = MagicMock()
+    mock.supports_session = True
+    mock.check_availability.return_value = None
+    mock.resume_hint.return_value = None
+    if side_effects is not None:
+        mock.run_prompt.side_effect = side_effects
+    else:
+        mock.run_prompt.return_value = {"assistant_response": "ok"}
+    return mock
+
+
+def _invoke_main(
+    tmp_path: Path,
+    mock_runner: MagicMock,
+    prompts: list[Prompt],
+    *,
+    extra_args: list[str] | None = None,
+    settings: dict | None = None,
+    config_dir: Path | None = None,
+) -> tuple:
+    """Invoke main() via CliRunner with standard mocks.
+
+    Returns (result, output_path).
+    """
+    input_file = tmp_path / "prompts.txt"
+    input_file.write_text("placeholder\n")
+    output = tmp_path / "report.json"
+    args = [str(input_file), "-o", str(output)]
+    if extra_args:
+        args.extend(extra_args)
+
+    with (
+        patch("prompter.cli.prepare_prompts", return_value=prompts),
+        patch("prompter.cli.create_runner", return_value=mock_runner),
+        patch("prompter.cli.find_config_dir", return_value=config_dir),
+        patch("prompter.cli.load_settings", return_value=settings or {}),
+        patch("prompter.cli.setup_logging"),
+    ):
+        result = runner_cli.invoke(app, args)
+
+    return result, output
+
+
+TWO_PROMPTS = [Prompt("First", "body1"), Prompt("Second", "body2")]
+FOUR_PROMPTS = [
+    Prompt("P1", "body1"),
+    Prompt("P2", "body2"),
+    Prompt("P3", "body3"),
+    Prompt("P4", "body4"),
+]
+
+
+# ─── Interrupt tests ──────────────────────────────────────────────────────
+
+class TestInterrupt:
+    """Interrupt scenarios (INT-01..INT-03)."""
 
     def test_interrupt_repeat(self, tmp_path: Path) -> None:
-        """Test (R)epeat option after KeyboardInterrupt (TC-09, scenario 2)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2")
-        output_file = tmp_path / "report.json"
+        """INT-01: KeyboardInterrupt → 'R' → repeat same prompt (TC-10)."""
+        output = tmp_path / "report.json"
+        call_count = 0
 
-        # Mock run_prompt: first call raises KeyboardInterrupt, next two succeed
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [
-            KeyboardInterrupt(),  # First call
-            ({"result": "ok"}, "sess1"),  # Repeat of first
-            ({"result": "ok"}, "sess1"),  # Second prompt
-        ]
+        def run_prompt_side_effect(prompt, timeout):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise KeyboardInterrupt
+            return {"assistant_response": "ok"}
 
-        # Mock input to return "R" (repeat)
-        mock_input = MagicMock(return_value="R")
+        mock_runner = _make_runner()
+        mock_runner.run_prompt.side_effect = run_prompt_side_effect
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.input", mock_input), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
+        with patch("prompter.cli.input", return_value="R"):
+            code = execution_loop([Prompt("Only", "body")], mock_runner, 60, output)
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
+        assert code == 0
+        assert mock_runner.run_prompt.call_count == 2
 
-            # Should succeed
-            assert result.exit_code == 0
-
-            # run_prompt should be called 3 times (1st + repeat + 2nd)
-            assert mock_run_prompt.call_count == 3
-
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
-            assert len(report) == 2
-            assert all(r["status"] == "success" for r in report)
+        report = json.loads(output.read_text())
+        assert len(report) == 1
+        assert report[0]["status"] == "success"
 
     def test_interrupt_next(self, tmp_path: Path) -> None:
-        """Test (N)ext option after KeyboardInterrupt (TC-09, scenario 3)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2")
-        output_file = tmp_path / "report.json"
+        """INT-02: KeyboardInterrupt → 'N' → skip prompt, next continues (TC-11)."""
+        output = tmp_path / "report.json"
 
-        # Mock run_prompt: first call raises KeyboardInterrupt, second succeeds
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [
-            KeyboardInterrupt(),  # First call
-            ({"result": "ok"}, "sess1"),  # Second prompt
-        ]
+        mock_runner = _make_runner(
+            [KeyboardInterrupt, {"assistant_response": "ok"}]
+        )
 
-        # Mock input to return "N" (next/skip)
-        mock_input = MagicMock(return_value="N")
+        with patch("prompter.cli.input", return_value="N"):
+            code = execution_loop(TWO_PROMPTS, mock_runner, 60, output)
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.input", mock_input), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
+        assert code == 0
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should succeed
-            assert result.exit_code == 0
-
-            # run_prompt should be called twice
-            assert mock_run_prompt.call_count == 2
-
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
-            assert len(report) == 2
-            assert report[0]["status"] == "skipped"
-            assert report[1]["status"] == "success"
+        report = json.loads(output.read_text())
+        assert len(report) == 2
+        assert report[0]["status"] == "skipped"
+        assert report[1]["status"] == "success"
 
     def test_interrupt_exit(self, tmp_path: Path) -> None:
-        """Test (E)xit option after KeyboardInterrupt (TC-09, scenario 4, INT-03)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2\n---\nPrompt 3")
-        output_file = tmp_path / "report.json"
+        """INT-03: KeyboardInterrupt → 'E' → stop, error entry in report (TC-12)."""
+        output = tmp_path / "report.json"
 
-        # Mock run_prompt: first call raises KeyboardInterrupt
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [KeyboardInterrupt()]
+        mock_runner = _make_runner([KeyboardInterrupt])
 
-        # Mock input to return "E" (exit)
-        mock_input = MagicMock(return_value="E")
+        with patch("prompter.cli.input", return_value="E"):
+            code = execution_loop(TWO_PROMPTS, mock_runner, 60, output)
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.input", mock_input), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
+        assert code == 0
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should succeed (exit is clean shutdown)
-            assert result.exit_code == 0
-
-            # run_prompt should be called once
-            assert mock_run_prompt.call_count == 1
-
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
-            assert len(report) == 1  # Only first prompt
-            assert report[0]["status"] == "error"
-            assert "error" in report[0]
-            assert "Interrupted by user" in report[0]["error"]
+        report = json.loads(output.read_text())
+        assert len(report) == 1
+        assert report[0]["status"] == "error"
+        assert report[0]["error"] == "Interrupted by user"
 
     def test_interrupt_invalid_then_repeat(self, tmp_path: Path) -> None:
-        """Test invalid input followed by (R)epeat (TC-09, scenario 5)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2")
-        output_file = tmp_path / "report.json"
+        """INT-01: invalid input ignored, then 'R' accepted (TC-10)."""
+        output = tmp_path / "report.json"
+        call_count = 0
 
-        # Mock run_prompt: first call raises KeyboardInterrupt, next two succeed
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [
-            KeyboardInterrupt(),  # First call
-            ({"result": "ok"}, "sess1"),  # Repeat of first
-            ({"result": "ok"}, "sess1"),  # Second prompt
-        ]
+        def run_prompt_side_effect(prompt, timeout):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise KeyboardInterrupt
+            return {"assistant_response": "ok"}
 
-        # Mock input: first returns "X" (invalid), second returns "R"
-        mock_input = MagicMock(side_effect=["X", "R"])
+        mock_runner = _make_runner()
+        mock_runner.run_prompt.side_effect = run_prompt_side_effect
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.input", mock_input), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
+        with patch("prompter.cli.input", side_effect=["X", "R"]):
+            code = execution_loop([Prompt("Only", "body")], mock_runner, 60, output)
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should succeed
-            assert result.exit_code == 0
-
-            # input() should be called twice (invalid, then valid)
-            assert mock_input.call_count == 2
-
-            # run_prompt should be called 3 times (1st + repeat + 2nd)
-            assert mock_run_prompt.call_count == 3
+        assert code == 0
+        assert mock_runner.run_prompt.call_count == 2
 
     def test_interrupt_next_first_prompt_new_session(self, tmp_path: Path) -> None:
-        """Test (N)ext on first prompt establishes new session (TC-09, scenario 6)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2")
-        output_file = tmp_path / "report.json"
+        """INT-02: skip 1st prompt → 2nd still succeeds, exit code 0."""
+        output = tmp_path / "report.json"
 
-        # Mock run_prompt: first call raises KeyboardInterrupt, second returns new session
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [
-            KeyboardInterrupt(),  # First call
-            ({"result": "ok"}, "sess_new"),  # Second prompt (new session)
-        ]
+        mock_runner = _make_runner(
+            [KeyboardInterrupt, {"assistant_response": "second ok"}]
+        )
 
-        # Mock input to return "N" (next/skip)
-        mock_input = MagicMock(return_value="N")
+        with patch("prompter.cli.input", return_value="N"):
+            code = execution_loop(TWO_PROMPTS, mock_runner, 60, output)
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.input", mock_input), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
+        assert code == 0
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
+        report = json.loads(output.read_text())
+        assert len(report) == 2
+        assert report[0]["status"] == "skipped"
+        assert report[1]["status"] == "success"
 
-            # Should succeed (no session integrity error since session_id was None)
-            assert result.exit_code == 0
 
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
-            assert len(report) == 2
-            assert report[0]["status"] == "skipped"
-            assert report[1]["status"] == "success"
-
+# ─── SIGTERM tests ─────────────────────────────────────────────────────────
 
 class TestSigterm:
-    """Tests for SIGTERM handling (TC-09, scenario 7, INT-04)."""
+    """SIGTERM scenarios (INT-04)."""
 
     def test_sigterm_graceful_termination(self, tmp_path: Path) -> None:
-        """Test graceful termination on SIGTERM (TC-09, scenario 7)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2\n---\nPrompt 3")
-        output_file = tmp_path / "report.json"
+        """INT-04: SigtermReceived → error entry, exit code 143 (TC-13)."""
+        output = tmp_path / "report.json"
 
-        # Mock run_prompt: first call raises SigtermReceived
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [SigtermReceived()]
+        mock_runner = _make_runner([SigtermReceived()])
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
+        code = execution_loop(TWO_PROMPTS, mock_runner, 60, output)
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
+        assert code == 143
 
-            # Should exit with 143 (SIGTERM exit code)
-            assert result.exit_code == 143
-
-            # run_prompt should be called once
-            assert mock_run_prompt.call_count == 1
-
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
-            assert len(report) == 1  # Only first prompt
-            assert report[0]["status"] == "error"
-            assert "error" in report[0]
-            assert "Terminated by SIGTERM" in report[0]["error"]
-
-
-class TestRepeatedInterrupt:
-    """Tests for repeated SIGINT (TC-09, scenario 8)."""
+        report = json.loads(output.read_text())
+        assert len(report) == 1
+        assert report[0]["status"] == "error"
+        assert report[0]["error"] == "Terminated by SIGTERM"
 
     def test_interrupt_repeated_sigint(self, tmp_path: Path) -> None:
-        """Test repeated Ctrl+C during R/N/E prompt (TC-09, scenario 8)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2")
-        output_file = tmp_path / "report.json"
+        """KeyboardInterrupt during input() → exit code 130, no report."""
+        input_file = tmp_path / "prompts.txt"
+        input_file.write_text("prompt body\n")
+        output = tmp_path / "report.json"
 
-        # Mock run_prompt: first call raises KeyboardInterrupt
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [KeyboardInterrupt()]
+        mock_runner = _make_runner([KeyboardInterrupt])
 
-        # Mock input to raise KeyboardInterrupt (simulating Ctrl+C during prompt)
-        mock_input = MagicMock(side_effect=KeyboardInterrupt())
-
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.input", mock_input), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
-
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should exit with 130 (POSIX SIGINT)
-            assert result.exit_code == 130
-
-            # run_prompt should be called once
-            assert mock_run_prompt.call_count == 1
-
-            # Report should NOT be saved (KeyboardInterrupt before save)
-            assert not output_file.exists()
-
-
-class TestErrorCases:
-    """Tests for error handling scenarios."""
-
-    def test_claude_cli_not_found(self, tmp_path: Path) -> None:
-        """Test error when claude CLI is not in PATH (ORC-09)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1")
-        output_file = tmp_path / "report.json"
-
-        # Mock shutil.which to return None (claude not found)
-        with patch("prompter.cli.shutil.which", return_value=None):
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should exit with code 1
-            assert result.exit_code == 1
-
-    def test_input_file_not_found(self) -> None:
-        """Test error when input file doesn't exist (ERR-10)."""
-        result = runner.invoke(app, ["/nonexistent/file.txt"])
-
-        # Should exit with error (Typer validates file existence)
-        assert result.exit_code != 0
-
-    def test_invalid_timeout_value(self, tmp_path: Path) -> None:
-        """Test error when timeout is below minimum (CLI-05)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("Prompt 1")
-
-        # Try to set timeout below minimum (10)
-        result = runner.invoke(app, [str(prompts_file), "-t", "5"])
-
-        # Should exit with error
-        assert result.exit_code != 0
-
-
-class TestVersionFlag:
-    """Tests for --version flag (CLI-02)."""
-
-    def test_version_flag_without_input(self) -> None:
-        """Test --version works without input_file (CLI-02)."""
-        result = runner.invoke(app, ["--version"])
-
-        # Should succeed
-        assert result.exit_code == 0
-
-        # Should print version
-        assert "0.1.8" in result.stdout or "0.0.0" in result.stdout
-
-    def test_version_flag_eager(self, tmp_path: Path) -> None:
-        """Test --version is eager (exits before other validation)."""
-        # Don't create the file - it shouldn't matter
-        nonexistent = tmp_path / "nonexistent.txt"
-
-        result = runner.invoke(app, [str(nonexistent), "--version"])
-
-        # Should succeed (version checked before file validation)
-        assert result.exit_code == 0
-        assert "0.1.8" in result.stdout or "0.0.0" in result.stdout
-
-
-class TestConfiguration:
-    """Tests for configuration system integration (CFG-01, CFG-07)."""
-
-    def test_cli_args_override_defaults(self, tmp_path: Path) -> None:
-        """Test CLI arguments override default values."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1")
-        output_file = tmp_path / "custom_output.json"
-
-        # Mock run_prompt to succeed
-        mock_run_prompt = MagicMock(return_value=({"result": "ok"}, "sess1"))
-
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
-
-            result = runner.invoke(
-                app,
-                [str(prompts_file), "-o", str(output_file), "-t", "100"]
+        with (
+            patch("prompter.cli.prepare_prompts", return_value=TWO_PROMPTS),
+            patch("prompter.cli.create_runner", return_value=mock_runner),
+            patch("prompter.cli.find_config_dir", return_value=None),
+            patch("prompter.cli.load_settings", return_value={}),
+            patch("prompter.cli.setup_logging"),
+            patch("prompter.cli.input", side_effect=KeyboardInterrupt),
+        ):
+            result = runner_cli.invoke(
+                app, [str(input_file), "-o", str(output)]
             )
 
-            # Should succeed
-            assert result.exit_code == 0
-
-            # Verify custom output file was used
-            assert output_file.exists()
-
-            # Verify timeout was passed to run_prompt
-            call_kwargs = mock_run_prompt.call_args
-            # timeout is 3rd positional arg
-            assert call_kwargs[0][2] == 100
-
-    def test_settings_file_loaded(self, tmp_path: Path) -> None:
-        """Test settings.json is loaded and merged (CFG-06, CFG-07)."""
-        # Create config directory with settings.json
-        config_dir = tmp_path / "config"
-        config_dir.mkdir()
-        settings_file = config_dir / "settings.json"
-        settings_file.write_text(json.dumps({"timeout": 500, "verbose": True}))
-
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1")
-        output_file = tmp_path / "report.json"
-
-        # Mock run_prompt to succeed
-        mock_run_prompt = MagicMock(return_value=({"result": "ok"}, "sess1"))
-
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
-
-            result = runner.invoke(
-                app,
-                [str(prompts_file), "-o", str(output_file), "-c", str(config_dir)]
-            )
-
-            # Should succeed
-            assert result.exit_code == 0
-
-            # Verify timeout from settings was used
-            call_kwargs = mock_run_prompt.call_args
-            assert call_kwargs[0][2] == 500  # timeout from settings.json
+        assert result.exit_code == 130
+        assert not output.exists()
 
 
-class TestSessionControl:
-    """Tests for session management (TC-12, EXE-06, ORC-02, LOG-08)."""
+# ─── Session & logging tests ─────────────────────────────────────────────
 
-    def test_session_id_logged(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-        """Test session_id is logged before each prompt (ORC-02)."""
-        import logging
+class TestSession:
+    """Session-related scenarios (ORC-02, ORC-08, LOG-08)."""
 
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2")
-        output_file = tmp_path / "report.json"
+    def test_session_id_logged(self, tmp_path: Path) -> None:
+        """ORC-02: runner logs 'session: ...' before each prompt."""
+        from prompter.runner.base import AssistantRunner
 
-        # Mock run_prompt to return session_id
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [
-            ({"result": "ok1"}, "sess_abc"),
-            ({"result": "ok2"}, "sess_abc"),
+        class _StubRunner(AssistantRunner):
+            supports_session = True
+
+            def check_availability(self):
+                pass
+
+            def resume_hint(self):
+                return None
+
+            def _execute_prompt(self, prompt, timeout):
+                return {"result": "ok"}, "sess_test"
+
+        stub = _StubRunner({})
+
+        with patch("prompter.runner.base.logger") as mock_base_logger:
+            result, output = _invoke_main(tmp_path, stub, TWO_PROMPTS)
+
+        assert result.exit_code == 0
+
+        session_calls = [
+            c for c in mock_base_logger.info.call_args_list
+            if len(c.args) >= 1 and "session" in str(c.args[0])
         ]
+        assert len(session_calls) == 2
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"), \
-             caplog.at_level(logging.INFO):
+    def test_session_restore_command_logged(self, tmp_path: Path) -> None:
+        """LOG-08: resume_hint logged after report save."""
+        mock_runner = _make_runner()
+        mock_runner.resume_hint.return_value = (
+            "To continue this session interactively, run: claude --resume sess_abc"
+        )
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
+        with patch("prompter.cli.logger") as mock_logger:
+            result, output = _invoke_main(
+                tmp_path, mock_runner, [Prompt("Only", "body")]
+            )
 
-            # Should succeed
-            assert result.exit_code == 0
-
-            # Check that session_id was logged at INFO level
-            info_messages = [r.message for r in caplog.records if r.levelname == "INFO"]
-            assert any("sess_abc" in msg for msg in info_messages)
-
-    def test_session_restore_command_logged(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-        """Test session restore command is logged (LOG-08)."""
-        import logging
-
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1")
-        output_file = tmp_path / "report.json"
-
-        # Mock run_prompt to return session_id
-        mock_run_prompt = MagicMock(return_value=({"result": "ok"}, "sess_abc"))
-
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"), \
-             caplog.at_level(logging.INFO):
-
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should succeed
-            assert result.exit_code == 0
-
-            # Check that restore command was logged
-            info_messages = [r.message for r in caplog.records if r.levelname == "INFO"]
-            assert any("claude --resume sess_abc" in msg for msg in info_messages)
+        assert result.exit_code == 0
+        info_messages = [
+            str(c) for c in mock_logger.info.call_args_list
+        ]
+        assert any("claude --resume sess_abc" in m for m in info_messages)
 
     def test_session_restore_command_not_logged_without_session(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ) -> None:
-        """Test session restore command not logged when no session (LOG-08)."""
-        import logging
+        """LOG-08: resume_hint not logged when None."""
+        mock_runner = _make_runner(
+            [SessionIntegrityError("No session_id received from first prompt")]
+        )
+        mock_runner.resume_hint.return_value = None
 
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1")
-        output_file = tmp_path / "report.json"
+        with patch("prompter.cli.logger") as mock_logger:
+            result, output = _invoke_main(
+                tmp_path, mock_runner, [Prompt("Only", "body")]
+            )
 
-        # Mock run_prompt to return None session_id (fatal error ORC-03)
-        mock_run_prompt = MagicMock(return_value=({"result": "ok"}, None))
+        assert result.exit_code == 1
+        info_messages = " ".join(
+            str(c) for c in mock_logger.info.call_args_list
+        )
+        assert "claude --resume" not in info_messages
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"), \
-             caplog.at_level(logging.INFO):
+    def test_fatal_error_session_integrity(self, tmp_path: Path) -> None:
+        """ORC-08: SessionIntegrityError → exit 1, 1 error entry (TC-14)."""
+        mock_runner = _make_runner(
+            [SessionIntegrityError("No session_id received from first prompt")]
+        )
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
+        with patch("prompter.cli.logger") as mock_logger:
+            result, output = _invoke_main(
+                tmp_path, mock_runner, TWO_PROMPTS
+            )
 
-            # Should fail with exit code 1
-            assert result.exit_code == 1
+        assert result.exit_code == 1
+        assert mock_runner.run_prompt.call_count == 1
 
-            # Check that restore command was NOT logged
-            all_messages = [r.message for r in caplog.records]
-            assert not any("claude --resume" in msg for msg in all_messages)
+        error_calls = [
+            str(c) for c in mock_logger.error.call_args_list
+        ]
+        assert any("No session_id" in m for m in error_calls)
+
+        report = json.loads(output.read_text())
+        assert len(report) == 1
+        assert report[0]["status"] == "error"
+        assert "No session_id" in report[0]["error"]
+
+    def test_session_integrity_lost_session_id(self, tmp_path: Path) -> None:
+        """ORC-06: lost session_id on 2nd prompt → exit 1, 2 entries."""
+        mock_runner = _make_runner([
+            {"result": "ok"},
+            SessionIntegrityError(
+                "Session integrity error: no session_id received"
+            ),
+        ])
+
+        with patch("prompter.cli.logger") as mock_logger:
+            result, output = _invoke_main(
+                tmp_path, mock_runner,
+                [Prompt("P1", "b1"), Prompt("P2", "b2"), Prompt("P3", "b3")],
+            )
+
+        assert result.exit_code == 1
+        assert mock_runner.run_prompt.call_count == 2
+
+        error_calls = " ".join(str(c) for c in mock_logger.error.call_args_list)
+        assert "no session_id received" in error_calls
+
+        report = json.loads(output.read_text())
+        assert len(report) == 2
+        assert report[0]["status"] == "success"
+        assert report[1]["status"] == "error"
+
+    def test_session_integrity_changed_session_id(self, tmp_path: Path) -> None:
+        """ORC-07: changed session_id → exit 1, 2 entries."""
+        mock_runner = _make_runner([
+            {"result": "ok"},
+            SessionIntegrityError(
+                "Session integrity error: session_id changed "
+                "from 'sess_abc' to 'sess_xyz'"
+            ),
+        ])
+
+        with patch("prompter.cli.logger") as mock_logger:
+            result, output = _invoke_main(
+                tmp_path, mock_runner,
+                [Prompt("P1", "b1"), Prompt("P2", "b2"), Prompt("P3", "b3")],
+            )
+
+        assert result.exit_code == 1
+        assert mock_runner.run_prompt.call_count == 2
+
+        error_calls = " ".join(str(c) for c in mock_logger.error.call_args_list)
+        assert "sess_abc" in error_calls
+        assert "sess_xyz" in error_calls
+
+        report = json.loads(output.read_text())
+        assert len(report) == 2
+        assert report[0]["status"] == "success"
+        assert report[1]["status"] == "error"
 
 
-class TestErrorResilience:
-    """Tests for error resilience (TC-14, ERR-01, ERR-06, REP-02, REP-05, REP-06, ERR-10)."""
+# ─── Error-recovery tests ────────────────────────────────────────────────
+
+class TestErrorRecovery:
+    """ERR-01..ERR-09: errors and timeouts don't stop execution."""
 
     def test_error_and_timeout_do_not_stop_execution(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ) -> None:
-        """Test execution continues after errors and timeouts (TC-14)."""
-        import logging
-        import subprocess
+        """ERR-06/ERR-01: error and timeout → continue to next prompt."""
+        mock_runner = _make_runner([
+            {"result": "ok"},
+            Exception("fail"),
+            subprocess.TimeoutExpired("cmd", 60),
+            {"result": "ok2"},
+        ])
 
-        # Create prompts file with 4 prompts
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2\n---\nPrompt 3\n---\nPrompt 4")
-        output_file = tmp_path / "report.json"
+        with patch("prompter.cli.logger") as mock_logger:
+            result, output = _invoke_main(
+                tmp_path, mock_runner, FOUR_PROMPTS
+            )
 
-        # Mock run_prompt with various outcomes
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [
-            ({"result": "ok"}, "sess1"),  # Prompt 1: success
-            Exception("fail"),  # Prompt 2: error
-            subprocess.TimeoutExpired("claude", 100),  # Prompt 3: timeout
-            ({"result": "ok2"}, "sess1"),  # Prompt 4: success
-        ]
+        assert result.exit_code == 0
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"), \
-             caplog.at_level(logging.ERROR):
+        error_calls = [str(c) for c in mock_logger.error.call_args_list]
+        assert len(error_calls) == 2
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should succeed (no unhandled exceptions)
-            assert result.exit_code == 0
-
-            # Check errors were logged
-            error_messages = [r.message for r in caplog.records if r.levelname == "ERROR"]
-            assert len(error_messages) >= 2  # At least error and timeout
-
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
-
-            assert len(report) == 4
-            assert report[0]["status"] == "success"
-            assert report[1]["status"] == "error"
-            assert "error" in report[1]
-            assert report[2]["status"] == "timeout"
-            assert "error" in report[2]
-            assert report[3]["status"] == "success"
-
-    def test_fatal_error_missing_session_id(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Test fatal error when first prompt doesn't return session_id (ORC-03, ERR-11)."""
-        import logging
-
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2")
-        output_file = tmp_path / "report.json"
-
-        # Mock run_prompt to return None session_id
-        mock_run_prompt = MagicMock(return_value=({"result": "ok"}, None))
-
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"), \
-             caplog.at_level(logging.ERROR):
-
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should exit with code 1
-            assert result.exit_code == 1
-
-            # Check error was logged
-            error_messages = [r.message for r in caplog.records if r.levelname == "ERROR"]
-            assert any("session_id" in msg for msg in error_messages)
-
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
-
-            assert len(report) == 1
-            assert report[0]["status"] == "error"
-            assert "error" in report[0]
-
-            # Second prompt not executed
-            assert mock_run_prompt.call_count == 1
-
-    def test_session_integrity_lost_session_id(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Test fatal error when session_id is lost on prompt N>1 (ORC-04)."""
-        import logging
-
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2\n---\nPrompt 3")
-        output_file = tmp_path / "report.json"
-
-        # Mock run_prompt: first returns session, second loses it
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [
-            ({"result": "ok"}, "sess_abc"),  # Prompt 1: establish session
-            ({"result": "ok2"}, None),  # Prompt 2: lost session_id
-        ]
-
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"), \
-             caplog.at_level(logging.ERROR):
-
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should exit with code 1
-            assert result.exit_code == 1
-
-            # Check error was logged with reason
-            error_messages = [r.message for r in caplog.records if r.levelname == "ERROR"]
-            assert any("session_id" in msg.lower() for msg in error_messages)
-
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
-
-            assert len(report) == 2
-            assert report[0]["status"] == "success"
-            assert report[1]["status"] == "error"
-            assert "error" in report[1]
-            assert "Session integrity error" in report[1]["error"]
-
-            # Third prompt not executed
-            assert mock_run_prompt.call_count == 2
-
-    def test_session_integrity_changed_session_id(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Test fatal error when session_id changes on prompt N>1 (ORC-04)."""
-        import logging
-
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2\n---\nPrompt 3")
-        output_file = tmp_path / "report.json"
-
-        # Mock run_prompt: session_id changes
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [
-            ({"result": "ok"}, "sess_abc"),  # Prompt 1
-            ({"result": "ok2"}, "sess_xyz"),  # Prompt 2: different session_id
-        ]
-
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"), \
-             caplog.at_level(logging.ERROR):
-
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should exit with code 1
-            assert result.exit_code == 1
-
-            # Check error was logged with both session IDs
-            error_messages = [r.message for r in caplog.records if r.levelname == "ERROR"]
-            assert any("sess_abc" in msg and "sess_xyz" in msg for msg in error_messages)
-
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
-
-            assert len(report) == 2
-            assert report[0]["status"] == "success"
-            assert report[1]["status"] == "error"
-            assert "error" in report[1]
-            assert "sess_abc" in report[1]["error"]
-            assert "sess_xyz" in report[1]["error"]
-
-            # Third prompt not executed
-            assert mock_run_prompt.call_count == 2
-
-    def test_exception_before_execution_loop(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Test graceful handling of exception before execution_loop (ERR-10)."""
-        import logging
-
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1")
-        output_file = tmp_path / "report.json"
-
-        # Mock prepare_prompts to raise exception
-        with patch("prompter.cli.prepare_prompts", side_effect=RuntimeError("parse failure")), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"), \
-             caplog.at_level(logging.ERROR):
-
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should exit with code 1
-            assert result.exit_code == 1
-
-            # Check error was logged
-            error_messages = [r.message for r in caplog.records if r.levelname == "ERROR"]
-            assert any("parse failure" in msg for msg in error_messages)
+        report = json.loads(output.read_text())
+        assert len(report) == 4
+        assert report[0]["status"] == "success"
+        assert report[1]["status"] == "error"
+        assert "error" in report[1]
+        assert report[2]["status"] == "timeout"
+        assert "error" in report[2]
+        assert report[3]["status"] == "success"
 
 
-class TestReportStructure:
-    """Tests for report structure (TC-15, REP-01, REP-02, REP-04, REP-05, REP-06)."""
+# ─── Availability tests ──────────────────────────────────────────────────
+
+class TestAvailability:
+    """ORC-09: assistant availability checks."""
+
+    def test_assistant_not_available(self, tmp_path: Path) -> None:
+        """ORC-09: check_availability raises → exit 1, run_prompt not called."""
+        mock_runner = _make_runner()
+        mock_runner.check_availability.side_effect = RuntimeError(
+            "claude CLI not found in $PATH"
+        )
+
+        with patch("prompter.cli.logger") as mock_logger:
+            result, output = _invoke_main(
+                tmp_path, mock_runner, [Prompt("Only", "body")]
+            )
+
+        assert result.exit_code == 1
+        mock_runner.run_prompt.assert_not_called()
+
+        error_calls = " ".join(str(c) for c in mock_logger.error.call_args_list)
+        assert "claude CLI not found" in error_calls
+
+    def test_exception_before_execution_loop(self, tmp_path: Path) -> None:
+        """ERR-10: prepare_prompts failure → exit 1, no traceback."""
+        input_file = tmp_path / "prompts.txt"
+        input_file.write_text("placeholder\n")
+        output = tmp_path / "report.json"
+
+        mock_runner = _make_runner()
+
+        with (
+            patch(
+                "prompter.cli.prepare_prompts",
+                side_effect=RuntimeError("parse failure"),
+            ),
+            patch("prompter.cli.create_runner", return_value=mock_runner),
+            patch("prompter.cli.find_config_dir", return_value=None),
+            patch("prompter.cli.load_settings", return_value={}),
+            patch("prompter.cli.setup_logging"),
+            patch("prompter.cli.logger") as mock_logger,
+        ):
+            result = runner_cli.invoke(app, [str(input_file), "-o", str(output)])
+
+        assert result.exit_code == 1
+        assert "Traceback" not in (result.output or "")
+        mock_runner.run_prompt.assert_not_called()
+
+        error_calls = " ".join(str(c) for c in mock_logger.error.call_args_list)
+        assert "parse failure" in error_calls
+
+
+# ─── Report tests ────────────────────────────────────────────────────────
+
+class TestReport:
+    """REP-01..REP-06: report structure and formatting."""
 
     def test_report_structure(self, tmp_path: Path) -> None:
-        """Test report contains all required fields with correct structure (TC-15)."""
-        import subprocess
+        """REP-01..REP-06: all 4 statuses, correct fields and format."""
+        mock_runner = _make_runner([
+            {"result": "ok"},
+            KeyboardInterrupt,
+            Exception("some error"),
+            subprocess.TimeoutExpired("cmd", 60),
+        ])
 
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1\n---\nPrompt 2\n---\nPrompt 3\n---\nPrompt 4")
-        output_file = tmp_path / "report.json"
+        with (
+            patch("prompter.cli.input", return_value="N"),
+        ):
+            result, output = _invoke_main(
+                tmp_path, mock_runner, FOUR_PROMPTS
+            )
 
-        # Mock run_prompt to produce all 4 statuses
-        mock_run_prompt = MagicMock()
-        mock_run_prompt.side_effect = [
-            ({"result": "ok"}, "sess1"),  # Success
-            KeyboardInterrupt(),  # Will be skipped via input("N")
-            Exception("test error"),  # Error
-            subprocess.TimeoutExpired("claude", 100),  # Timeout
-        ]
+        assert result.exit_code == 0
 
-        # Mock input for KeyboardInterrupt
-        mock_input = MagicMock(return_value="N")
+        report = json.loads(output.read_text())
+        assert isinstance(report, list)
+        assert len(report) == 4
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.input", mock_input), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
+        iso_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+        valid_statuses = {"success", "skipped", "error", "timeout"}
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
+        for entry in report:
+            assert isinstance(entry["prompt"], str)
+            assert "assistant_response" in entry
+            assert iso_pattern.match(entry["timestamp"]), (
+                f"Bad timestamp: {entry['timestamp']}"
+            )
+            assert entry["status"] in valid_statuses
 
-            # Should succeed
-            assert result.exit_code == 0
+        assert report[0]["status"] == "success"
+        assert "error" not in report[0]
 
-            # Verify report
-            with open(output_file) as f:
-                report = json.load(f)
+        assert report[1]["status"] == "skipped"
+        assert "error" not in report[1]
 
-            # Should be valid JSON array
-            assert isinstance(report, list)
-            assert len(report) == 4
+        assert report[2]["status"] == "error"
+        assert "error" in report[2]
 
-            # Check each record
-            for record in report:
-                # Required fields
-                assert "prompt" in record
-                assert isinstance(record["prompt"], str)
-                assert "claude_response" in record
-                assert "timestamp" in record
-                assert "status" in record
+        assert report[3]["status"] == "timeout"
+        assert "error" in report[3]
 
-                # Validate status
-                assert record["status"] in ("success", "skipped", "error", "timeout")
+    def test_report_overwrite_warning(self, tmp_path: Path) -> None:
+        """REP-02: existing file → overwritten with warning."""
+        output = tmp_path / "report.json"
+        output.write_text('["old data"]')
 
-                # Validate timestamp format (ISO 8601, no microseconds)
-                import re
-                assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", record["timestamp"])
+        mock_runner = _make_runner()
 
-            # Check error field presence based on status
-            assert "error" not in report[0]  # success
-            assert "error" not in report[1]  # skipped
-            assert "error" in report[2]  # error
-            assert "error" in report[3]  # timeout
+        with patch("prompter.report.logger") as mock_report_logger:
+            result, _ = _invoke_main(tmp_path, mock_runner, [Prompt("Only", "b")])
 
-    def test_report_overwrite_warning(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Test warning when overwriting existing report (REP-02)."""
-        import logging
+        assert result.exit_code == 0
 
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1")
-        output_file = tmp_path / "report.json"
+        report = json.loads(output.read_text())
+        assert len(report) == 1
+        assert report[0]["status"] == "success"
 
-        # Create existing report file
-        output_file.write_text('{"old": "data"}')
+        warning_calls = " ".join(
+            str(c) for c in mock_report_logger.warning.call_args_list
+        )
+        assert "already exists" in warning_calls
 
-        # Mock run_prompt
-        mock_run_prompt = MagicMock(return_value=({"result": "ok"}, "sess1"))
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"), \
-             caplog.at_level(logging.WARNING):
+# ─── DOC-03 / user messages ─────────────────────────────────────────────
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
-
-            # Should succeed
-            assert result.exit_code == 0
-
-            # Check warning was logged
-            warning_messages = [r.message for r in caplog.records if r.levelname == "WARNING"]
-            assert any("already exists" in msg or "overwrite" in msg.lower() for msg in warning_messages)
-
-            # Verify report was overwritten with valid JSON
-            with open(output_file) as f:
-                report = json.load(f)
-
-            assert isinstance(report, list)
-            assert len(report) == 1
+class TestUserMessages:
+    """DOC-03: user-facing messages in English (ASCII)."""
 
     def test_user_messages_english(self, tmp_path: Path) -> None:
-        """Test all user messages are in English (DOC-03)."""
-        # Create prompts file
-        prompts_file = tmp_path / "prompts.txt"
-        prompts_file.write_text("meta\n---\nPrompt 1")
-        output_file = tmp_path / "report.json"
+        """DOC-03: print/input strings contain only ASCII (TC-15)."""
+        output = tmp_path / "report.json"
+        mock_runner = _make_runner([KeyboardInterrupt])
 
-        # Mock run_prompt to trigger KeyboardInterrupt (shows R/N/E prompt)
-        mock_run_prompt = MagicMock(side_effect=KeyboardInterrupt())
+        captured_prints: list[str] = []
+        captured_inputs: list[str] = []
 
-        # Mock input to return "E" (will trigger user prompt)
-        mock_input = MagicMock(return_value="E")
+        original_input = None
 
-        with patch("prompter.cli.run_prompt", mock_run_prompt), \
-             patch("prompter.cli.input", mock_input) as patched_input, \
-             patch("prompter.cli.shutil.which", return_value="/usr/bin/claude"):
+        def fake_input(prompt=""):
+            captured_inputs.append(prompt)
+            return "E"
 
-            result = runner.invoke(app, [str(prompts_file), "-o", str(output_file)])
+        with (
+            patch("prompter.cli.input", side_effect=fake_input),
+            patch("builtins.print", side_effect=lambda *a, **kw: captured_prints.append(
+                " ".join(str(x) for x in a)
+            )),
+        ):
+            execution_loop([Prompt("Only", "body")], mock_runner, 60, output)
 
-            # Get the prompt text passed to input()
-            if patched_input.called:
-                input_prompt = patched_input.call_args[0][0]
+        cyrillic = re.compile(r"[\u0400-\u04FF]")
+        for text in captured_prints + captured_inputs:
+            assert not cyrillic.search(text), f"Cyrillic found: {text!r}"
 
-                # Check for ASCII-only (no Cyrillic)
-                # Allow standard ASCII + some common symbols
-                try:
-                    input_prompt.encode('ascii')
-                    # If encoding succeeds, it's ASCII-only
-                    assert True
-                except UnicodeEncodeError:
-                    # Contains non-ASCII characters
-                    pytest.fail(f"User prompt contains non-ASCII characters: {input_prompt}")
+
+# ─── Assistant selection tests ───────────────────────────────────────────
+
+class TestAssistantSelection:
+    """CLI-07: --assistant flag and settings priority."""
+
+    def test_create_runner_via_main(self, tmp_path: Path) -> None:
+        """CLI-07: default assistant is 'claude'."""
+        input_file = tmp_path / "prompts.txt"
+        input_file.write_text("placeholder\n")
+        output = tmp_path / "report.json"
+        mock_runner = _make_runner()
+
+        with (
+            patch("prompter.cli.prepare_prompts", return_value=[Prompt("P", "b")]),
+            patch("prompter.cli.create_runner", return_value=mock_runner) as mock_create,
+            patch("prompter.cli.find_config_dir", return_value=None),
+            patch("prompter.cli.load_settings", return_value={}),
+            patch("prompter.cli.setup_logging"),
+        ):
+            result = runner_cli.invoke(
+                app, [str(input_file), "-o", str(output)]
+            )
+
+        assert result.exit_code == 0
+        mock_create.assert_called_once()
+        assert mock_create.call_args[0][0] == "claude"
+
+    def test_unknown_assistant_exits_with_error(self, tmp_path: Path) -> None:
+        """CLI-07: unknown assistant → exit 1."""
+        input_file = tmp_path / "prompts.txt"
+        input_file.write_text("placeholder\n")
+        output = tmp_path / "report.json"
+
+        with (
+            patch("prompter.cli.prepare_prompts", return_value=[Prompt("P", "b")]),
+            patch(
+                "prompter.cli.create_runner",
+                side_effect=ValueError("Unknown assistant: 'unknown'"),
+            ),
+            patch("prompter.cli.find_config_dir", return_value=None),
+            patch("prompter.cli.load_settings", return_value={}),
+            patch("prompter.cli.setup_logging"),
+        ):
+            result = runner_cli.invoke(
+                app,
+                [str(input_file), "-o", str(output), "--assistant", "unknown"],
+            )
+
+        assert result.exit_code == 1
+
+    def test_assistant_flag_explicit(self, tmp_path: Path) -> None:
+        """CLI-07: --assistant gemini → create_runner('gemini', ...)."""
+        input_file = tmp_path / "prompts.txt"
+        input_file.write_text("placeholder\n")
+        output = tmp_path / "report.json"
+        mock_runner = _make_runner()
+
+        with (
+            patch("prompter.cli.prepare_prompts", return_value=[Prompt("P", "b")]),
+            patch("prompter.cli.create_runner", return_value=mock_runner) as mock_create,
+            patch("prompter.cli.find_config_dir", return_value=None),
+            patch("prompter.cli.load_settings", return_value={}),
+            patch("prompter.cli.setup_logging"),
+        ):
+            result = runner_cli.invoke(
+                app,
+                [str(input_file), "-o", str(output), "--assistant", "gemini"],
+            )
+
+        assert result.exit_code == 0
+        assert mock_create.call_args[0][0] == "gemini"
+
+    def test_assistant_from_settings(self, tmp_path: Path) -> None:
+        """CLI-07: settings.json assistant → used when no CLI flag."""
+        input_file = tmp_path / "prompts.txt"
+        input_file.write_text("placeholder\n")
+        output = tmp_path / "report.json"
+        mock_runner = _make_runner()
+
+        with (
+            patch("prompter.cli.prepare_prompts", return_value=[Prompt("P", "b")]),
+            patch("prompter.cli.create_runner", return_value=mock_runner) as mock_create,
+            patch("prompter.cli.find_config_dir", return_value=tmp_path),
+            patch(
+                "prompter.cli.load_settings",
+                return_value={"assistant": "gemini"},
+            ),
+            patch("prompter.cli.setup_logging"),
+        ):
+            result = runner_cli.invoke(
+                app, [str(input_file), "-o", str(output)]
+            )
+
+        assert result.exit_code == 0
+        assert mock_create.call_args[0][0] == "gemini"
+
+    def test_assistant_cli_overrides_settings(self, tmp_path: Path) -> None:
+        """CLI-07: CLI flag overrides settings.json."""
+        input_file = tmp_path / "prompts.txt"
+        input_file.write_text("placeholder\n")
+        output = tmp_path / "report.json"
+        mock_runner = _make_runner()
+
+        with (
+            patch("prompter.cli.prepare_prompts", return_value=[Prompt("P", "b")]),
+            patch("prompter.cli.create_runner", return_value=mock_runner) as mock_create,
+            patch("prompter.cli.find_config_dir", return_value=None),
+            patch(
+                "prompter.cli.load_settings",
+                return_value={"assistant": "gemini"},
+            ),
+            patch("prompter.cli.setup_logging"),
+        ):
+            result = runner_cli.invoke(
+                app,
+                [str(input_file), "-o", str(output), "--assistant", "claude"],
+            )
+
+        assert result.exit_code == 0
+        assert mock_create.call_args[0][0] == "claude"

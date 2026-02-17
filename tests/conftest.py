@@ -1,11 +1,9 @@
-"""Pytest configuration for Prompter tests."""
+"""Pytest configuration: shared fixtures and markers."""
 
 import pytest
 
 
 def pytest_configure(config):
-    """Register custom markers."""
     config.addinivalue_line(
-        "markers",
-        "e2e: end-to-end tests (require real claude CLI)"
+        "markers", "e2e: end-to-end tests (require real AI assistant)"
     )

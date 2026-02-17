@@ -2,12 +2,8 @@
   "version": 1,
   "disable_existing_loggers": false,
   "formatters": {
-    "file": {
-      "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    },
-    "console": {
-      "format": "%(asctime)s - %(message)s"
-    }
+    "file": { "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s" },
+    "console": { "format": "%(asctime)s - %(message)s" }
   },
   "handlers": {
     "file": {
